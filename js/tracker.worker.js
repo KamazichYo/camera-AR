@@ -64,6 +64,7 @@ let F32 = null, MU = null, D = null, V = null;
 let orb = null, matcher = null;
 let offscreen = null, offctx = null;
 let st = null; // состояние трекинга
+let sel = null; // выбор углов на живом видео: { pts: [{ p, rays, snapped, miss, fail, score }] }
 
 const I3 = () => [1, 0, 0, 0, 1, 0, 0, 0, 1];
 
@@ -795,8 +796,13 @@ function extrapolate(H1, H0) {
 function lock(msg) {
   loadFrame(msg);
   normalize(gray, norm);
+  return startTracking(inQuad(msg.quad), msg);
+}
+
+/** Начать трекинг холста по текущему кадру (gray и norm уже загружены). quad — в координатах OpenCV. */
+function startTracking(quad, msg) {
   dropState();
-  const quad = inQuad(msg.quad);
+  sel = null;
   st = {
     quad,
     searchQuad: expandQuad(quad, msg.margin ?? CFG.margin),
@@ -826,6 +832,7 @@ function lock(msg) {
   const goodEdges = st.edges.filter((e) => e.use).length;
   return {
     type: 'locked',
+    quad: outQuad(quad),
     points: st.initialPts,
     features: kf.n,
     edges: goodEdges,
@@ -1215,7 +1222,7 @@ function refineQuad(maps, q, opt = {}) {
   let cur = q, ok = false;
   for (let it = 0; it < (opt.iters || 1); it++) {
     const keep = DET.searchPx;
-    DET.searchPx = it === 0 && opt.iters ? 4 : keep;
+    DET.searchPx = opt.iters ? [7, 5, 3][Math.min(it, 2)] : keep; // сначала широкий поиск краёв, затем уже точнее
     const nq = refineOnce(maps, cur, !opt.anchors);
     DET.searchPx = keep;
     if (!nq) break;
@@ -1312,8 +1319,8 @@ function raySupport(edge, qx, qy, th, L, pts) {
   return n ? hit / n : 0;
 }
 
-function snapCorner(maps, tap, others) {
-  const M = Math.max(W, H), R = SNAP.radius * M, L = SNAP.rayLen * M;
+function snapCorner(maps, tap, others, opt = {}) {
+  const M = Math.max(W, H), R = opt.radius || SNAP.radius * M, L = SNAP.rayLen * M;
   const pad = R + L + 8;
   const edge = edgeOrientMap(maps, Math.floor(tap[0] - pad), Math.floor(tap[1] - pad), Math.ceil(tap[0] + pad), Math.ceil(tap[1] + pad));
   const K = SNAP.rays, step = 2 * Math.PI / K;
@@ -1347,13 +1354,19 @@ function snapCorner(maps, tap, others) {
           // настоящий угол: ОБА края опираются на весь луч; точка рядом с углом на одной стороне имеет
           // у второго луча лишь частичную опору — произведение это строго наказывает
           const base = Math.pow(sup[i] * sup[j], 0.75) * (1 - 0.3 * Math.max(0, opp - 0.25));
-          const score = base * (1 - 0.2 * (d / R) * (d / R));
+          let score = base * (1 - 0.2 * (d / R) * (d / R));
+          if (opt.rays) { // тот же угол, что в прошлом кадре: края идут примерно в тех же направлениях
+            const near = (a, b) => { let dd = Math.abs(a - b); dd = Math.min(dd, K - dd); return dd <= 1; };
+            const [a, b] = opt.rays;
+            if ((near(i, a) && near(j, b)) || (near(i, b) && near(j, a))) score *= 1.15;
+            else score *= 0.8;
+          }
           if (!best || score > best.score) best = { score, x: qx, y: qy, i, j };
         }
       }
     }
   }
-  if (!best || best.score < SNAP.minScore) return { snapped: false, p: tap, score: best ? best.score : 0 };
+  if (!best || best.score < (opt.minScore || SNAP.minScore)) return { snapped: false, p: tap, score: best ? best.score : 0 };
   // уточнение: прямые по краевым точкам вдоль двух лучей, угол — их пересечение
   let p = [best.x, best.y];
   const lines = [];
@@ -1366,39 +1379,99 @@ function snapCorner(maps, tap, others) {
     const c = lineIntersect(lines[0], lines[1]);
     if (c && Math.hypot(c[0] - best.x, c[1] - best.y) < 6) p = c;
   }
-  return { snapped: true, p, score: best.score };
+  return { snapped: true, p, score: best.score, rays: [best.i, best.j] };
 }
 
 /** Четыре точки в любом порядке → упорядоченный четырёхугольник, уточнённый по краям между ними. */
-function buildQuad(maps, pts, taps) {
+function buildQuad(maps, pts, taps, rad) {
   const idx = orderIdx(pts), o = idx.map((i) => pts[i]);
   if (!convex(o) || Math.abs(quadArea(o)) < 0.002 * W * H) return { quad: null };
-  const r = refineQuad(maps, o, { iters: 3, anchors: idx.map((i) => taps[i]), rad: 1.6 * SNAP.radius * Math.max(W, H) });
+  const r = refineQuad(maps, o, { iters: 3, anchors: idx.map((i) => taps[i]), rad: rad || 1.6 * SNAP.radius * Math.max(W, H) });
   return { quad: r || o, refined: !!r };
 }
 
-function snap(msg) {
-  loadFrame(msg);
+// ---------- выбор углов на живом видео ----------
+// Кадр не замирает. Касание ставит точку на ближайшем углу, и с этого момента точка ведётся
+// сама: каждый кадр — оптический поток (прогноз), затем привязка к углу рядом с прогнозом
+// (края того же направления, малый радиус) — так точка не уплывает вместе с фоном.
+// Когда отмечены все 4 угла, рамка строится и трекинг холста стартует с текущего кадра.
+const SELT = { lkWin: 21, snapRadius: 8, maxJump: 6, maxMiss: 12, maxFail: 25 };
+
+function selSwap() { const t = prevNorm; prevNorm = norm; norm = t; }
+
+/** Сдвинуть отмеченные точки с прошлого кадра на текущий. Возвращает карты градиента текущего кадра. */
+function selUpdate() {
   const maps = gradientMaps(false);
-  const res = snapCorner(maps, inQuad([msg.point])[0], inQuad(msg.others || []));
-  return { type: 'snapped', snapped: res.snapped, score: +res.score.toFixed(2), p: outQuad([res.p])[0] };
+  const act = sel.pts.filter((pt) => !pt.lost);
+  if (!act.length) return maps;
+  const flat = [];
+  for (const pt of act) flat.push(pt.p[0], pt.p[1]);
+  const { idx, out } = lkPairs(prevNorm, norm, flat, SELT.lkWin, 3, true);
+  const got = new Map(idx.map((i, k) => [i, k]));
+  act.forEach((pt, i) => {
+    const k = got.get(i);
+    if (k === undefined) { // поток потерял точку — держим на месте, пока не вернётся
+      if (++pt.miss > SELT.maxMiss) pt.lost = true;
+      return;
+    }
+    pt.miss = 0;
+    const p = [out[k * 2], out[k * 2 + 1]];
+    const r = snapCorner(maps, p, [], { radius: SELT.snapRadius, rays: pt.rays, minScore: 0.35 });
+    if (r.snapped && Math.hypot(r.p[0] - p[0], r.p[1] - p[1]) < SELT.maxJump) {
+      pt.p = r.p; pt.rays = r.rays; pt.score = r.score; pt.fail = 0;
+    } else {
+      pt.p = p;
+      if (++pt.fail > SELT.maxFail) pt.lost = true;
+    }
+  });
+  return maps;
 }
 
-/**
- * Финальный проход после 4-го касания. Сначала каждый угол пересчитывается заново, теперь уже
- * зная остальные три (рёбра холста идут к соседним углам) — это спасает первые касания и слабые
- * углы; затем точки упорядочиваются и рамка уточняется по краям между ними.
- */
-function buildFromTaps(msg) {
+const selOut = () => sel.pts.map((pt) => ({ p: outQuad([pt.p])[0], snapped: pt.snapped, lost: !!pt.lost, score: +(pt.score || 0).toFixed(2) }));
+
+function selStart(msg) {
   loadFrame(msg);
-  const maps = gradientMaps(false);
-  const taps = inQuad(msg.taps), first = inQuad(msg.snapped);
-  const pts = msg.second === false ? first : taps.map((t, i) => {
-    const r = snapCorner(maps, t, first.filter((_, j) => j !== i));
-    return r.snapped ? r.p : first[i];
-  });
-  const r = buildQuad(maps, pts, taps);
-  return { type: 'quad', quad: r.quad && outQuad(r.quad), refined: !!r.refined, corners: outQuad(pts) };
+  normalize(gray, norm);
+  norm.copyTo(prevNorm);
+  dropState(); st = null;
+  sel = { pts: [] };
+  return { type: 'selStarted' };
+}
+
+function selFrame(msg) {
+  if (msg.w !== W || msg.h !== H) { // сменился размер кадра (поворот) — выбор начинается заново
+    loadFrame(msg); normalize(gray, norm); norm.copyTo(prevNorm);
+    sel.pts = [];
+    return { type: 'sel', pts: [], reset: true };
+  }
+  loadFrame(msg);
+  normalize(gray, norm);
+  selUpdate();
+  selSwap();
+  return { type: 'sel', pts: selOut() };
+}
+
+function selTap(msg) {
+  if (!sel) throw new Error('выбор углов не начат');
+  loadFrame(msg);
+  normalize(gray, norm);
+  const maps = selUpdate();
+  const tap = inQuad([msg.point])[0];
+  const active = sel.pts.filter((pt) => !pt.lost);
+  const r = snapCorner(maps, tap, active.map((pt) => pt.p));
+  sel.pts.push({ p: r.p, rays: r.rays || null, snapped: r.snapped, miss: 0, fail: 0, score: r.score });
+  if (sel.pts.length < 4) { selSwap(); return { type: 'tapped', snapped: r.snapped, p: outQuad([r.p])[0], pts: selOut() }; }
+  // все 4 угла отмечены: рамка = упорядоченные точки, уточнённые по краям между ними
+  const pts = sel.pts.map((pt) => pt.p);
+  const b = buildQuad(maps, pts, pts, 26); // допуск: на сколько рамка может уйти от отмеченных точек // допуск: на сколько рамка может уйти от отмеченных точек
+  if (!b.quad) { selSwap(); return { type: 'tapped', snapped: r.snapped, p: outQuad([r.p])[0], pts: selOut(), badQuad: true }; }
+  const lockInfo = startTracking(b.quad, msg); // копирует norm → prevNorm и сбрасывает sel
+  return { ...lockInfo, type: 'locked', tapped: true, snapped: r.snapped, p: outQuad([r.p])[0] };
+}
+
+function selBack() {
+  if (sel) sel.pts.pop();
+  return { type: 'ok', pts: sel ? selOut() : [] };
 }
 
 function detect(msg) {
@@ -1427,16 +1500,17 @@ self.onmessage = async (e) => {
     if (!ready) throw new Error('OpenCV ещё не загружен');
     let res;
     if (msg.type === 'lock') res = lock(msg);
-    else if (msg.type === 'frame') res = track(msg);
+    else if (msg.type === 'frame') res = sel ? selFrame(msg) : track(msg);
+    else if (msg.type === 'selStart') res = selStart(msg);
+    else if (msg.type === 'selTap') res = selTap(msg);
+    else if (msg.type === 'selBack') res = selBack();
     else if (msg.type === 'detect') res = detect(msg);
-    else if (msg.type === 'snap') res = snap(msg);
-    else if (msg.type === 'quad') res = buildFromTaps(msg);
     else if (msg.type === 'setQuad') {
       // пользователь поправил рамку холста во время трекинга (в опорных координатах)
       if (st) { st.quad = inQuad(msg.quad); st.searchQuad = expandQuad(st.quad, msg.margin ?? CFG.margin); }
       res = { type: 'ok' };
     } else if (msg.type === 'unlock') {
-      dropState(); st = null; res = { type: 'unlocked' };
+      dropState(); st = null; sel = null; res = { type: 'unlocked' };
     }
     if (res) postMessage({ ...res, id: msg.id });
   } catch (err) {

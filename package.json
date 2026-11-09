@@ -9,9 +9,10 @@
     "test:tracker": "node tests/tracker.test.cjs",
     "test:detect": "node tests/detect.test.cjs",
     "test:snap": "node tests/snap.test.cjs",
-    "test:e2e": "node tests/e2e.test.cjs && node tests/e2e-real.test.cjs",
+    "test:e2e": "node tests/e2e.test.cjs && node tests/e2e-real.test.cjs && node tests/e2e-video.test.cjs",
     "test:latency": "node tests/latency.test.cjs",
-    "test": "npm run test:data && npm run test:tracker && npm run test:detect && npm run test:snap && npm run test:e2e && npm run test:latency"
+    "test": "npm run test:data && npm run test:tracker && npm run test:detect && npm run test:snap && npm run test:video && npm run test:e2e && npm run test:latency",
+    "test:video": "node tests/video.test.cjs"
   },
   "devDependencies": {
     "@techstark/opencv-js": "4.10.0-release.1",

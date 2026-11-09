@@ -20,6 +20,7 @@ export class ArTracker {
     this.running = false;
     this.busy = false;
     this.onPose = null;    // (H в координатах видео, info) => void
+    this.onSel = null;     // (углы выбора [{ p, snapped, lost }], reset) => void
     this.stats = { fps: 0, ms: 0 };
     this._fpsT = 0; this._fpsN = 0;
   }
@@ -116,22 +117,34 @@ export class ArTracker {
     return multiply([1 / sx, 0, 0, 0, 1 / sy, 0, 0, 0, 1], multiply(Hp, [sx, 0, 0, 0, sy, 0, 0, 0, 1]));
   }
 
-  /** Притянуть касание к ближайшему настоящему углу (там, где сходятся два длинных края). */
-  async snapCorner(pt, others = []) {
+  /**
+   * Выбор углов на живом видео. Касание ставит точку на ближайшем углу (selTap), дальше точка сама
+   * ведётся по кадрам — позиции приходят в onSel. Когда отмечены 4 угла, трекинг холста стартует сам.
+   */
+  async selStart() {
     await this.init();
-    const r = await this._send('snap', { point: this._toProc([pt])[0], others: this._toProc(others) });
-    return { snapped: r.snapped, score: r.score, p: this._fromProc([r.p])[0] };
+    this.running = true;
+    this.busy = false;
+    await this._send('selStart');
+    this._loop();
   }
 
-  /**
-   * 4 касания (в любом порядке) + их первичные притяжения → упорядоченный четырёхугольник,
-   * уточнённый по краям (quad === null — точки не образуют четырёхугольник).
-   */
-  async buildQuad(taps, snapped) {
-    await this.init();
-    const r = await this._send('quad', { taps: this._toProc(taps), snapped: this._toProc(snapped) });
-    return { quad: r.quad ? this._fromProc(r.quad) : null, refined: r.refined };
+  /** Касание в координатах видео → { locked: false, snapped, p, pts } или { locked: true, info } (трекинг стартовал). */
+  async selTap(pt, { fullFrame = false } = {}) {
+    const r = await this._send('selTap', { point: this._toProc([pt])[0], fullFrame });
+    if (r.type === 'locked') {
+      return { locked: true, info: { ...r, quad: this._fromProc(r.quad) }, snapped: r.snapped, p: this._fromProc([r.p])[0] };
+    }
+    return { locked: false, snapped: r.snapped, p: this._fromProc([r.p])[0], pts: this._selPts(r.pts), badQuad: !!r.badQuad };
   }
+
+  /** Убрать последний отмеченный угол. */
+  async selBack() {
+    const r = await this._call({ type: 'selBack' });
+    return this._selPts(r.pts || []);
+  }
+
+  _selPts(pts) { return pts.map((pt) => ({ ...pt, p: this._fromProc([pt.p])[0] })); }
 
   /** Начать отслеживание. quad — холст в координатах видео (текущий кадр становится опорным). */
   async lock(quad, { fullFrame = false } = {}) {
@@ -157,14 +170,15 @@ export class ArTracker {
 
   _loop() {
     if (!this.running) return;
+    const gen = this._gen = (this._gen || 0) + 1; // новый запуск цикла останавливает старый
     const v = this.video;
     const next = () => {
-      if (!this.running) return;
+      if (!this.running || gen !== this._gen) return;
       if ('requestVideoFrameCallback' in v) v.requestVideoFrameCallback(tick);
       else requestAnimationFrame(tick);
     };
     const tick = (nowT) => {
-      if (!this.running) return;
+      if (!this.running || gen !== this._gen) return;
       if (this.busy || v.readyState < 2) return next();
       this.busy = true;
       // момент, когда этот кадр показан на экране, — от него считается задержка позы
@@ -172,7 +186,9 @@ export class ArTracker {
       this._send('frame')
         .then((r) => {
           this.busy = false;
-          if (!this.running || r.state === 'off') return;
+          if (!this.running) return;
+          if (r.type === 'sel') { this.onSel && this.onSel(this._selPts(r.pts), !!r.reset); return; }
+          if (r.state === 'off') return;
           this._countFps(r.ms);
           this.onPose && this.onPose(this._hToVideo(r.H), r, frameTime);
         })
