@@ -8,7 +8,8 @@
     "test:data": "python3 tests/gen_scene.py",
     "test:tracker": "node tests/tracker.test.cjs",
     "test:e2e": "node tests/e2e.test.cjs",
-    "test": "npm run test:data && npm run test:tracker && npm run test:e2e"
+    "test:latency": "node tests/latency.test.cjs",
+    "test": "npm run test:data && npm run test:tracker && npm run test:e2e && npm run test:latency"
   },
   "devDependencies": {
     "@techstark/opencv-js": "4.10.0-release.1",

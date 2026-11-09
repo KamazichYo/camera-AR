@@ -29,7 +29,7 @@ function check(cond, msg) {
   if (!cond) process.exitCode = 1;
 }
 
-if (!fs.existsSync(path.join(DATA, 'gt.json'))) {
+if (!fs.existsSync(path.join(DATA, 'main', 'gt.json'))) {
   console.error('Нет тестовых данных: сначала запустите `python3 tests/gen_scene.py`');
   process.exit(1);
 }

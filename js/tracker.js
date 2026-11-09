@@ -1,5 +1,5 @@
 // Главный поток AR: захват уменьшенных кадров, общение с воркером, перевод координат.
-import { multiply, scaling } from './geometry.js';
+import { multiply } from './geometry.js';
 
 const CV_URLS = [
   'https://cdn.jsdelivr.net/npm/@techstark/opencv-js@4.10.0-release.1/dist/opencv.js',
@@ -35,7 +35,11 @@ export class ArTracker {
       for (const { reject } of this.pending.values()) reject(err);
       this.pending.clear();
     };
-    this.readyPromise = this._call({ type: 'init', urls: CV_URLS }).then((r) => { this._ready = true; return r; });
+    this.readyPromise = this._call({ type: 'init', urls: CV_URLS }).then((r) => {
+      this._ready = true;
+      this.useBitmap = !!r.bitmap && typeof createImageBitmap === 'function';
+      return r;
+    });
     this.readyPromise.catch(() => { this.readyPromise = null; this.worker.terminate(); this.worker = null; });
     return this.readyPromise;
   }
@@ -56,47 +60,73 @@ export class ArTracker {
     else p.resolve(m);
   }
 
-  /** Масштаб «видео → кадр анализа». */
-  get scale() {
+  /** Размер кадра анализа и точные коэффициенты «видео → кадр анализа». */
+  get proc() {
     const { videoWidth: vw, videoHeight: vh } = this.video;
-    return Math.min(1, PROC_MAX / Math.max(vw, vh));
+    const s = Math.min(1, PROC_MAX / Math.max(vw, vh));
+    const w = Math.max(16, Math.round(vw * s)), h = Math.max(16, Math.round(vh * s));
+    return { w, h, sx: w / vw, sy: h / vh };
   }
 
-  _grab() {
+  /**
+   * Уменьшенный кадр для воркера. Где можно — ImageBitmap: масштабирование делает
+   * браузер (GPU), а чтение пикселей происходит в воркере, не тормозя интерфейс.
+   */
+  async _grab() {
     const v = this.video;
-    const s = this.scale;
-    const w = Math.max(16, Math.round(v.videoWidth * s));
-    const h = Math.max(16, Math.round(v.videoHeight * s));
+    const { w, h } = this.proc;
+    if (this.useBitmap) {
+      try {
+        const bmp = await createImageBitmap(v, { resizeWidth: w, resizeHeight: h, resizeQuality: 'low' });
+        return { msg: { bmp, w, h }, transfer: [bmp] };
+      } catch (e) {
+        console.warn('ImageBitmap недоступен, читаю пиксели в главном потоке', e);
+        this.useBitmap = false;
+      }
+    }
     if (this.canvas.width !== w || this.canvas.height !== h) {
       this.canvas.width = w; this.canvas.height = h;
     }
     this.ctx.drawImage(v, 0, 0, w, h);
     const img = this.ctx.getImageData(0, 0, w, h);
-    return { buf: img.data.buffer, w, h };
+    return { msg: { buf: img.data.buffer, w, h }, transfer: [img.data.buffer] };
   }
 
-  _toProc(q) { const s = this.scale; return q.map(([x, y]) => [x * s, y * s]); }
-  _fromProc(q) { const s = 1 / this.scale; return q.map(([x, y]) => [x * s, y * s]); }
+  async _send(type, extra = {}) {
+    const f = await this._grab();
+    try {
+      return await this._call({ type, ...f.msg, ...extra }, f.transfer);
+    } catch (e) {
+      // воркер не смог прочитать ImageBitmap (старый браузер) — повторяем через буфер
+      if (f.msg.bmp && this.useBitmap) {
+        this.useBitmap = false;
+        const g = await this._grab();
+        return this._call({ type, ...g.msg, ...extra }, g.transfer);
+      }
+      throw e;
+    }
+  }
+
+  _toProc(q) { const { sx, sy } = this.proc; return q.map(([x, y]) => [x * sx, y * sy]); }
+  _fromProc(q) { const { sx, sy } = this.proc; return q.map(([x, y]) => [x / sx, y / sy]); }
 
   /** Гомография кадра анализа → координаты видео: S⁻¹·H·S. */
   _hToVideo(Hp) {
-    const s = this.scale;
-    return multiply(scaling(1 / s), multiply(Hp, scaling(s)));
+    const { sx, sy } = this.proc;
+    return multiply([1 / sx, 0, 0, 0, 1 / sy, 0, 0, 0, 1], multiply(Hp, [sx, 0, 0, 0, sy, 0, 0, 0, 1]));
   }
 
   async detectCanvas() {
     await this.init();
-    const f = this._grab();
-    const r = await this._call({ type: 'detect', ...f }, [f.buf]);
+    const r = await this._send('detect');
     return r.quad ? this._fromProc(r.quad) : null;
   }
 
   /** Начать отслеживание. quad — холст в координатах видео (текущий кадр становится опорным). */
-  async lock(quad, { margin = 0.12, fullFrame = false } = {}) {
+  async lock(quad, { fullFrame = false } = {}) {
     await this.init();
-    this.margin = margin;
-    const f = this._grab();
-    const r = await this._call({ type: 'lock', ...f, quad: this._toProc(quad), margin, fullFrame }, [f.buf]);
+    this.running = false;
+    const r = await this._send('lock', { quad: this._toProc(quad), fullFrame });
     this.running = true;
     this.busy = false;
     this._loop();
@@ -106,7 +136,7 @@ export class ArTracker {
   /** Обновить область холста (в координатах опорного кадра видео). */
   setQuad(refQuad) {
     if (!this.running) return;
-    this._call({ type: 'setQuad', quad: this._toProc(refQuad), margin: this.margin }).catch(() => {});
+    this._call({ type: 'setQuad', quad: this._toProc(refQuad) }).catch(() => {});
   }
 
   stop() {
@@ -122,17 +152,18 @@ export class ArTracker {
       if ('requestVideoFrameCallback' in v) v.requestVideoFrameCallback(tick);
       else requestAnimationFrame(tick);
     };
-    const tick = () => {
+    const tick = (nowT) => {
       if (!this.running) return;
       if (this.busy || v.readyState < 2) return next();
       this.busy = true;
-      const f = this._grab();
-      this._call({ type: 'frame', ...f }, [f.buf])
+      // момент, когда этот кадр показан на экране, — от него считается задержка позы
+      const frameTime = typeof nowT === 'number' ? nowT : performance.now();
+      this._send('frame')
         .then((r) => {
           this.busy = false;
           if (!this.running || r.state === 'off') return;
           this._countFps(r.ms);
-          this.onPose && this.onPose(this._hToVideo(r.H), r);
+          this.onPose && this.onPose(this._hToVideo(r.H), r, frameTime);
         })
         .catch((err) => { this.busy = false; console.warn('AR', err); });
       next();
