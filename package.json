@@ -1,0 +1,17 @@
+{
+  "name": "artcam",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Камера для художника: запись, референс поверх холста, AR-привязка",
+  "scripts": {
+    "start": "npx --yes http-server -c-1 -p 8080 .",
+    "test:data": "python3 tests/gen_scene.py",
+    "test:tracker": "node tests/tracker.test.cjs",
+    "test:e2e": "node tests/e2e.test.cjs",
+    "test": "npm run test:data && npm run test:tracker && npm run test:e2e"
+  },
+  "devDependencies": {
+    "@techstark/opencv-js": "4.10.0-release.1",
+    "playwright": "1.63.0"
+  }
+}
