@@ -21,7 +21,7 @@ def main():
     if not os.path.exists(os.path.join(ROOT, 'f001.png')):
         subprocess.check_call(['ffmpeg', '-v', 'error', '-y', '-i', MOV, '-vsync', '0', os.path.join(ROOT, 'f%03d.png')])
     names = sorted(n for n in os.listdir(ROOT) if n.startswith('f') and n.endswith('.png'))
-    if NAME != 'video':  # для e2e с фейковой камерой (штрихкод кадра) нужен только ролик с холстом
+    if NAME not in ('video', 'art'):  # для e2e с фейковой камерой (штрихкод кадра) нужны только ролики с холстом
         print('кадров', len(names))
         return
     first = np.asarray(Image.open(os.path.join(ROOT, names[0])).convert('RGB'))

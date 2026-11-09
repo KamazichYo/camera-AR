@@ -32,7 +32,7 @@ export class ArTracker {
     this.running = false;
     this.busy = false;
     this.onPose = null;    // (H в координатах видео, info) => void
-    this.onSel = null;     // (углы выбора [{ p, snapped, lost }], reset) => void
+    this.onSel = null;     // (углы выбора [{ p, snapped, feature, lost }], reset) => void
     this.stats = { fps: 0, ms: 0 };
     this._fpsT = 0; this._fpsN = 0;
   }
@@ -147,9 +147,9 @@ export class ArTracker {
   async selTap(pt, { fullFrame = false } = {}) {
     const r = await this._send('selTap', { point: this._toProc([pt])[0], fullFrame });
     if (r.type === 'locked') {
-      return { locked: true, info: { ...r, quad: this._fromProc(r.quad) }, snapped: r.snapped, p: this._fromProc([r.p])[0] };
+      return { locked: true, info: { ...r, quad: this._fromProc(r.quad) }, snapped: r.snapped, feature: !!r.feature, p: this._fromProc([r.p])[0] };
     }
-    return { locked: false, snapped: r.snapped, p: this._fromProc([r.p])[0], pts: this._selPts(r.pts), badQuad: !!r.badQuad };
+    return { locked: false, snapped: r.snapped, feature: !!r.feature, p: this._fromProc([r.p])[0], pts: this._selPts(r.pts), badQuad: !!r.badQuad };
   }
 
   /** Убрать последний отмеченный угол. */

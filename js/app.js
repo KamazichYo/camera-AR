@@ -42,7 +42,7 @@ const ar = {
   mode: 'off',                     // off | loading | select | tracking
   state: 'tracking',               // tracking | lost
   H: IDENTITY,                     // опорный кадр → текущий (координаты видео)
-  corners: [],                     // отмеченные углы (их ведёт воркер): { p, snapped, lost }
+  corners: [],                     // отмеченные углы (их ведёт воркер): { p, snapped, feature, lost }
   anchors: [],                     // точки опоры (неподвижные предметы), в координатах опорного кадра
   anchorMode: false,               // идёт отметка точек опоры
   pendingTap: null,                // касание, которое ещё притягивается к углу: [x, y]
@@ -274,9 +274,9 @@ async function onCornerTap(sp) {
     if (r.locked) { onLocked(r.info); return; }
     ar.corners = r.pts;
     if (r.badQuad) toast('Эти точки не складываются в четырёхугольник. «Назад» — и отметьте угол заново.', { ms: 4500 });
-    else if (!r.snapped && !noCornerHinted) {
+    else if (!r.snapped && !r.feature && !noCornerHinted) {
       noCornerHinted = true; // один раз за выбор: на ладони или гладкой бумаге углов нет, и так задумано
-      toast('Угла рядом нет — точка остаётся там, где нажали. Для ладони и гладкой бумаги так и надо.', { ms: 3500 });
+      toast('Ни угла, ни контрастной детали рядом нет — точка остаётся там, где нажали. Для ладони и гладкой бумаги так и надо.', { ms: 3500 });
     }
   } catch (e) {
     console.error(e);
@@ -431,7 +431,7 @@ function updateArUi() {
     $('#ar-back').disabled = n === 0;
     $('#ar-back').title = 'Назад — убрать последнюю точку опоры';
     $('#ar-cancel').title = 'Готово';
-    $('#ar-hint').textContent = n ? 'Точек опоры: ' + n + '. Ещё — нажмите на неподвижный предмет' : 'Нажмите на неподвижные предметы рядом: стол, провод. Не руки и не карандаш';
+    $('#ar-hint').textContent = n ? 'Точек опоры: ' + n + '. Ещё — на детали в плоскости холста' : 'Нажмите на неподвижные детали в одной плоскости с холстом: рама, мольберт, край стола под ним. Не руки';
   }
   const btnAnchor = $('#btn-anchor');
   btnAnchor.hidden = ar.mode !== 'tracking';
@@ -508,7 +508,7 @@ function frame(t) {
       const [x, y] = stage.toScreen(c.p);
       svg += c.lost
         ? `<circle class="mark lost" cx="${x}" cy="${y}" r="13"/>`
-        : `<circle class="mark ${c.snapped ? 'snap' : 'free'}" cx="${x}" cy="${y}" r="13"/><text class="hlabel" x="${x}" y="${y + 5}">${i + 1}</text>`;
+        : `<circle class="mark ${c.snapped || c.feature ? 'snap' : 'free'}" cx="${x}" cy="${y}" r="13"/><text class="hlabel" x="${x}" y="${y + 5}">${i + 1}</text>`;
     });
     if (ar.pendingTap) {
       const [x, y] = stage.toScreen(ar.pendingTap);
@@ -539,7 +539,7 @@ function frame(t) {
   // статистика
   if (S.stats && ar.mode === 'tracking' && ar.info) {
     const i = ar.info;
-    $('#stats').textContent = `${tracker.stats.fps} к/с · ${i.ms} мс · точек ${i.points} · inl ${i.inliers} · kf ${i.keyframes} · ${i.source}${sync.active ? ' · показ с задержкой ' + Math.round(sync.delay) + ' мс, кадр ' + sync.bw + '×' + sync.bh + ' (' + sync.grabMs.toFixed(0) + '+' + sync.drawMs.toFixed(0) + ' мс)' : ''} · анализ ${tracker.procMax}px`;
+    $('#stats').textContent = `${tracker.stats.fps} к/с · ${i.ms} мс · точек ${i.points} · inl ${i.inliers} · kf ${i.keyframes} · ${i.source}${sync.active ? ' · показ с задержкой ' + Math.round(sync.delay) + ' мс, кадр ' + sync.bw + '×' + sync.bh + ' (' + sync.grabMs.toFixed(0) + '+' + sync.drawMs.toFixed(0) + ' мс), экстрапол. ' + sync.extrap + '/' + sync.draws : ''} · анализ ${tracker.procMax}px`;
   } else $('#stats').textContent = '';
 
   // таймер записи
