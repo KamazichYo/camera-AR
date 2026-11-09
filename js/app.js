@@ -23,6 +23,7 @@ const DEFAULTS = {
   quadN: null,
 };
 const S = loadSettings(DEFAULTS);
+const DEBUG = { predict: true }; // переключатели для автотестов
 const persist = () => saveSettings(S);
 
 // ---------- объекты ----------
@@ -198,7 +199,7 @@ const overlayEditor = new QuadEditor(stage, {
   getQuad: () => (ref.loaded ? displayQuad || overlayQuad : null),
   setQuad: (q) => setOverlayQuad(q),
   onStart: () => { editing = true; overlayQuad = displayQuad || overlayQuad; },
-  onEnd: () => { editing = false; filter.reset(); saveQuad(); },
+  onEnd: () => { editing = false; filter.reset(); ar.vel = null; ar.lastRaw = null; saveQuad(); },
 });
 
 const selectEditor = new QuadEditor(stage, {
@@ -250,9 +251,10 @@ async function arStart() {
   if (ar.mode !== 'select') return;
   const q = ar.selectQuad;
   try {
-    const r = await tracker.lock(q, { margin: 0.12, fullFrame: S.surroundings });
+    const r = await tracker.lock(q, { fullFrame: S.surroundings });
     ar.refCanvas = q;
     ar.H = IDENTITY;
+    ar.vel = null; ar.lastRaw = null;
     ar.state = 'tracking';
     ar.lostSince = 0;
     if (ref.loaded && !overlayQuad) restoreQuad();
@@ -261,7 +263,7 @@ async function arStart() {
     ar.mode = 'tracking';
     updateArUi();
     if (r.weak) {
-      toast('Мало деталей для отслеживания. Нарисуйте метки/наклейте малярный скотч по углам холста или включите «Учитывать окружение».', { ms: 7000 });
+      toast('Холст почти не отличается от фона и на нём нет деталей — трекинг будет неустойчивым. Подложите под холст контрастный фон, наклейте метки (малярный скотч) или включите «Учитывать окружение».', { ms: 8000 });
     } else toast('AR включён — референс привязан к холсту');
   } catch (e) {
     console.error(e);
@@ -280,14 +282,28 @@ function arStop(silent = false) {
   if (!silent) toast('AR выключен — референс зафиксирован на экране');
 }
 
-tracker.onPose = (H, info) => {
+tracker.onPose = (H, info, frameTime) => {
   if (ar.mode !== 'tracking') return;
   ar.info = info;
   if (info.state === 'tracking') {
+    // скорость углов референса (px/мс) — для компенсации задержки трекинга
+    if (ar.refOverlay) {
+      const raw = applyQuad(H, ar.refOverlay);
+      if (ar.state === 'tracking' && ar.lastRaw && frameTime > ar.poseT) {
+        const dt = frameTime - ar.poseT;
+        const v = raw.map((p, i) => [(p[0] - ar.lastRaw[i][0]) / dt, (p[1] - ar.lastRaw[i][1]) / dt]);
+        ar.vel = ar.vel ? ar.vel.map((o, i) => [o[0] * 0.4 + v[i][0] * 0.6, o[1] * 0.4 + v[i][1] * 0.6]) : v;
+      } else ar.vel = null;
+      ar.lastRaw = raw;
+    }
+    ar.poseT = frameTime;
     ar.H = H;
     if (ar.state !== 'tracking') filter.reset();
     ar.lostSince = 0;
-  } else if (!ar.lostSince) ar.lostSince = performance.now();
+  } else {
+    ar.vel = null;
+    if (!ar.lostSince) ar.lostSince = performance.now();
+  }
   if (ar.state !== info.state) { ar.state = info.state; updateArUi(); }
 };
 
@@ -321,7 +337,16 @@ function frame(t) {
   if (ar.mode === 'tracking' && ar.refOverlay) {
     if (editing) displayQuad = overlayQuad;
     else {
-      const raw = applyQuad(ar.H, ar.refOverlay);
+      let raw = applyQuad(ar.H, ar.refOverlay);
+      // Поза относится к кадру, показанному ar.poseT назад; на экране уже более новый кадр.
+      // Сдвигаем референс вперёд по оценённой скорости (не дальше 120 мс).
+      if (ar.vel && ar.state === 'tracking' && DEBUG.predict) {
+        const lead = Math.min(120, Math.max(0, t - ar.poseT));
+        const speed = Math.max(...ar.vel.map((v) => Math.hypot(v[0], v[1])));
+        // плавный порог: дрожание в покое не усиливается, движение компенсируется полностью
+        const k = Math.min(1, Math.max(0, (speed * lead - 0.8) / 2));
+        if (k > 0) raw = raw.map((p, i) => [p[0] + ar.vel[i][0] * lead * k, p[1] + ar.vel[i][1] * lead * k]);
+      }
       displayQuad = S.smoothing > 0 ? filter.filter(raw, t) : raw;
       overlayQuad = displayQuad;
     }
@@ -583,6 +608,7 @@ function bind() {
     if (!q) return;
     setOverlayQuad(fn(q));
     filter.reset();
+    ar.vel = null; ar.lastRaw = null;
     saveQuad();
   };
   $('#btn-flip-h').onclick = () => editQuad((q) => [q[1], q[0], q[3], q[2]]);
@@ -747,6 +773,6 @@ async function init() {
 }
 
 // для отладки и автотестов
-window.artcam = { S, ar, stage, tracker, camera, recorder, ref, get overlayQuad() { return overlayQuad; }, get displayQuad() { return displayQuad; }, arBegin, arStart, arStop, loadReference };
+window.artcam = { S, ar, DEBUG, filter, stage, tracker, camera, recorder, ref, get overlayQuad() { return overlayQuad; }, get displayQuad() { return displayQuad; }, arBegin, arStart, arStop, loadReference };
 
 init();
