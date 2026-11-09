@@ -42,7 +42,7 @@ const ar = {
   mode: 'off',                     // off | loading | select | tracking
   state: 'tracking',               // tracking | lost
   H: IDENTITY,                     // опорный кадр → текущий (координаты видео)
-  corners: [],                     // отмеченные углы (их ведёт воркер): { p, snapped, lost }
+  corners: [],                     // отмеченные углы (их ведёт воркер): { p, snapped, feature, lost }
   anchors: [],                     // точки опоры (неподвижные предметы), в координатах опорного кадра
   anchorMode: false,               // идёт отметка точек опоры
   pendingTap: null,                // касание, которое ещё притягивается к углу: [x, y]
@@ -274,9 +274,9 @@ async function onCornerTap(sp) {
     if (r.locked) { onLocked(r.info); return; }
     ar.corners = r.pts;
     if (r.badQuad) toast('Эти точки не складываются в четырёхугольник. «Назад» — и отметьте угол заново.', { ms: 4500 });
-    else if (!r.snapped && !noCornerHinted) {
+    else if (!r.snapped && !r.feature && !noCornerHinted) {
       noCornerHinted = true; // один раз за выбор: на ладони или гладкой бумаге углов нет, и так задумано
-      toast('Угла рядом нет — точка остаётся там, где нажали. Для ладони и гладкой бумаги так и надо.', { ms: 3500 });
+      toast('Ни угла, ни контрастной детали рядом нет — точка остаётся там, где нажали. Для ладони и гладкой бумаги так и надо.', { ms: 3500 });
     }
   } catch (e) {
     console.error(e);
@@ -508,7 +508,7 @@ function frame(t) {
       const [x, y] = stage.toScreen(c.p);
       svg += c.lost
         ? `<circle class="mark lost" cx="${x}" cy="${y}" r="13"/>`
-        : `<circle class="mark ${c.snapped ? 'snap' : 'free'}" cx="${x}" cy="${y}" r="13"/><text class="hlabel" x="${x}" y="${y + 5}">${i + 1}</text>`;
+        : `<circle class="mark ${c.snapped || c.feature ? 'snap' : 'free'}" cx="${x}" cy="${y}" r="13"/><text class="hlabel" x="${x}" y="${y + 5}">${i + 1}</text>`;
     });
     if (ar.pendingTap) {
       const [x, y] = stage.toScreen(ar.pendingTap);

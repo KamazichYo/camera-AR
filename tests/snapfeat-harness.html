@@ -1,0 +1,28 @@
+<!doctype html><body><script type="module">
+// Привязка касания к самому контрастному признаку: кадр tests/.data/<dir>/fNNN.png, касания по одному (после каждого — «назад»).
+// Параметры: ?dir=/t/.data/art&f=1&taps=[[x,y],...]
+const P = new URLSearchParams(location.search);
+const CV = 'https://cdn.jsdelivr.net/npm/@techstark/opencv-js@4.10.0-release.1/dist/opencv.js';
+const dir = P.get('dir') || '/t/.data/art', fr = +(P.get('f') || 1), taps = JSON.parse(P.get('taps') || '[]');
+const w = new Worker('/app/js/tracker.worker.js');
+let id = 0; const pend = new Map();
+w.onmessage = (e) => { const p = pend.get(e.data.id); pend.delete(e.data.id); e.data.type === 'error' ? p.rej(new Error(e.data.message)) : p.res(e.data); };
+const call = (m, extra = {}) => new Promise((res, rej) => { const i = ++id; pend.set(i, { res, rej }); w.postMessage({ ...m, ...extra, id: i }, extra.buf ? [extra.buf] : []); });
+const c = document.createElement('canvas'); const ctx = c.getContext('2d', { willReadFrequently: true });
+async function frame(t) {
+  const img = new Image(); img.src = `${dir}/f${String(t).padStart(3, '0')}.png`; await img.decode();
+  c.width = img.width; c.height = img.height; ctx.drawImage(img, 0, 0);
+  return { buf: ctx.getImageData(0, 0, c.width, c.height).data.buffer, w: c.width, h: c.height };
+}
+try {
+  await call({ type: 'init', urls: [CV] });
+  await call({ type: 'selStart' }, await frame(fr));
+  const out = [];
+  for (const p of taps) {
+    const r = await call({ type: 'selTap', point: p }, await frame(fr));
+    out.push({ tap: p, snapped: r.snapped, feature: r.feature, resp: r.resp, p: r.p });
+    await call({ type: 'selBack' });
+  }
+  window.result = { out };
+} catch (e) { window.result = { error: String(e && e.message || e) }; }
+</script>

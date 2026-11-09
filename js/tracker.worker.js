@@ -1915,6 +1915,47 @@ function raySupport(edge, qx, qy, th, L, pts) {
   return n ? hit / n : 0;
 }
 
+/**
+ * Нет пересечения прямых — берём самый контрастный признак рядом с касанием (кончик тёмного пятна, угол мазка, метка):
+ * максимум «угловатости» (меньшее собственное число матрицы градиентов, как в Ши–Томаси) в окне вокруг касания, с лёгким
+ * предпочтением ближнего. Такая точка к тому же хорошо ведётся потоком. На гладком месте (бумага, кожа) признака нет.
+ */
+const FEAT = { radius: 0.04, minResp: 0.008, prox: 0.4 };
+function snapFeature(tap, opt = {}) {
+  const R = opt.radius || FEAT.radius * Math.max(W, H);
+  const x0 = Math.max(4, Math.floor(tap[0] - R)), y0 = Math.max(4, Math.floor(tap[1] - R));
+  const x1 = Math.min(W - 4, Math.ceil(tap[0] + R)), y1 = Math.min(H - 4, Math.ceil(tap[1] + R));
+  if (x1 - x0 < 8 || y1 - y0 < 8) return null;
+  const roi = gray.roi(new cv.Rect(x0 - 3, y0 - 3, Math.min(W, x1 + 3) - (x0 - 3), Math.min(H, y1 + 3) - (y0 - 3)));
+  const resp = new cv.Mat();
+  cv.cornerMinEigenVal(roi, resp, 5, 3);
+  const rw = resp.cols, d = resp.data32F;
+  let best = null;
+  for (let y = 3; y < resp.rows - 3; y++) {
+    for (let x = 3; x < rw - 3; x++) {
+      const gx = x0 - 3 + x, gy = y0 - 3 + y;
+      const dist = Math.hypot(gx - tap[0], gy - tap[1]);
+      if (dist > R) continue;
+      const v = d[y * rw + x];
+      if (v < (opt.minResp || FEAT.minResp)) continue;
+      const score = v * (1 - FEAT.prox * (dist / R) * (dist / R));
+      if (!best || score > best.score) best = { score, v, x, y, gx, gy };
+    }
+  }
+  let out = null;
+  if (best) {
+    // субпиксель: параболы по 3×3 вокруг максимума
+    const at = (x, y) => d[y * rw + x];
+    const c = at(best.x, best.y);
+    const dx = at(best.x - 1, best.y) - 2 * c + at(best.x + 1, best.y), dy = at(best.x, best.y - 1) - 2 * c + at(best.x, best.y + 1);
+    const ox = dx < 0 ? Math.max(-0.5, Math.min(0.5, 0.5 * (at(best.x - 1, best.y) - at(best.x + 1, best.y)) / dx)) : 0;
+    const oy = dy < 0 ? Math.max(-0.5, Math.min(0.5, 0.5 * (at(best.x, best.y - 1) - at(best.x, best.y + 1)) / dy)) : 0;
+    out = { p: [best.gx + ox, best.gy + oy], resp: best.v, score: best.score };
+  }
+  roi.delete(); resp.delete();
+  return out;
+}
+
 function snapCorner(maps, tap, others, opt = {}) {
   const M = Math.max(W, H), R = opt.radius || SNAP.radius * M, L = SNAP.rayLen * M;
   const pad = R + L + 8;
@@ -1962,7 +2003,14 @@ function snapCorner(maps, tap, others, opt = {}) {
       }
     }
   }
-  if (!best || best.score < (opt.minScore || SNAP.minScore)) return { snapped: false, p: tap, score: best ? best.score : 0 };
+  if (!best || best.score < (opt.minScore || SNAP.minScore)) {
+    // пересечения прямых нет — ближайший самый контрастный признак (только при выборе, не при ведении точки)
+    if (opt.feature) {
+      const f = snapFeature(tap);
+      if (f) return { snapped: false, feature: true, p: f.p, score: best ? best.score : 0, resp: f.resp };
+    }
+    return { snapped: false, p: tap, score: best ? best.score : 0 };
+  }
   // уточнение: прямые по краевым точкам вдоль двух лучей, угол — их пересечение
   let p = [best.x, best.y];
   const lines = [];
@@ -2025,7 +2073,7 @@ function selUpdate() {
   return maps;
 }
 
-const selOut = () => sel.pts.map((pt) => ({ p: outQuad([pt.p])[0], snapped: pt.snapped, lost: !!pt.lost, score: +(pt.score || 0).toFixed(2) }));
+const selOut = () => sel.pts.map((pt) => ({ p: outQuad([pt.p])[0], snapped: pt.snapped, feature: !!pt.feature, lost: !!pt.lost, score: +(pt.score || 0).toFixed(2) }));
 
 function selStart(msg) {
   loadFrame(msg);
@@ -2056,9 +2104,9 @@ function selTap(msg) {
   const maps = selUpdate();
   const tap = inQuad([msg.point])[0];
   const active = sel.pts.filter((pt) => !pt.lost);
-  const r = snapCorner(maps, tap, active.map((pt) => pt.p));
-  sel.pts.push({ p: r.p, rays: r.rays || null, snapped: r.snapped, miss: 0, fail: 0, score: r.score });
-  if (sel.pts.length < 4) { selSwap(); return { type: 'tapped', snapped: r.snapped, p: outQuad([r.p])[0], pts: selOut() }; }
+  const r = snapCorner(maps, tap, active.map((pt) => pt.p), { feature: true });
+  sel.pts.push({ p: r.p, rays: r.rays || null, snapped: r.snapped, feature: !!r.feature, miss: 0, fail: 0, score: r.score });
+  if (sel.pts.length < 4) { selSwap(); return { type: 'tapped', snapped: r.snapped, feature: !!r.feature, resp: r.resp, p: outQuad([r.p])[0], pts: selOut() }; }
   // все 4 угла отмечены: рамка = упорядоченные точки, уточнённые по краям между ними
   const pts = sel.pts.map((pt) => pt.p);
   // уточнять по краям есть смысл, только если углы найдены; иначе (ладонь, бумага) рамка — как отмечена
@@ -2071,7 +2119,7 @@ function selTap(msg) {
   } // допуск: на сколько рамка может уйти от отмеченных точек
   if (!b.quad) { selSwap(); return { type: 'tapped', snapped: r.snapped, p: outQuad([r.p])[0], pts: selOut(), badQuad: true }; }
   const lockInfo = startTracking(b.quad, msg); // копирует norm → prevNorm и сбрасывает sel
-  return { ...lockInfo, type: 'locked', tapped: true, snapped: r.snapped, p: outQuad([r.p])[0] };
+  return { ...lockInfo, type: 'locked', tapped: true, snapped: r.snapped, feature: !!r.feature, p: outQuad([r.p])[0] };
 }
 
 function selBack() {
