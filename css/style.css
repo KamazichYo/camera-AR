@@ -172,23 +172,37 @@ input[type=range] { flex: 1; accent-color: var(--accent); min-width: 80px; heigh
 body.recording .rec-btn span { width: 28px; height: 28px; border-radius: 7px; }
 
 /* ---------- выбор холста ---------- */
-/* Панель выбора углов: компактная, вверху, и пропускает касания — под ней тоже можно отмечать углы */
+/* Выбор углов и точек опоры: никакой плашки сверху — экран отдан камере. Подпись без фона (с тенью) и две круглые
+   кнопки внизу; сам блок пропускает касания, ловят их только кнопки. */
 #ar-select-bar {
-  position: fixed; z-index: 12; left: 0; right: 0; top: calc(var(--safe-t) + 58px);
-  display: flex; justify-content: center; padding: 0 12px; pointer-events: none;
+  position: fixed; z-index: 12; left: 0; right: 0; bottom: calc(var(--safe-b) + 18px);
+  display: flex; flex-direction: column; align-items: center; gap: 10px; padding: 0 16px; pointer-events: none;
 }
-#ar-select-bar .sel-pill {
-  display: flex; align-items: center; gap: 12px; flex-wrap: wrap; justify-content: center;
-  padding: 8px 12px; border-radius: 16px; max-width: 100%;
-  background: var(--panel); backdrop-filter: blur(12px); -webkit-backdrop-filter: blur(12px);
-  border: 1px solid var(--line);
+#ar-hint {
+  max-width: 340px; text-align: center; font-size: 14px; font-weight: 600; color: #fff;
+  text-shadow: 0 1px 2px rgba(0, 0, 0, .9), 0 0 10px rgba(0, 0, 0, .7);
 }
-#ar-select-bar button { pointer-events: auto; padding: 7px 12px; font-size: 14px; }
-#ar-hint { font-size: 15px; font-weight: 600; }
+.sel-row { display: flex; align-items: center; gap: 14px; }
+#ar-select-bar .round {
+  pointer-events: auto; width: 46px; height: 46px; padding: 0; border-radius: 50%; display: grid; place-items: center;
+  background: rgba(0, 0, 0, .42); backdrop-filter: blur(10px); -webkit-backdrop-filter: blur(10px);
+  border: 1px solid rgba(255, 255, 255, .28); color: #fff;
+}
+#ar-select-bar .round svg { width: 22px; height: 22px; fill: none; stroke: currentColor; stroke-width: 2; stroke-linecap: round; stroke-linejoin: round; }
+#ar-select-bar .round:disabled { opacity: .35; }
+#ar-select-bar .ic-check { display: none; }
+body.anchoring #ar-select-bar .ic-check { display: block; }
+body.anchoring #ar-select-bar .ic-close { display: none; }
+body.anchoring #ar-select-bar #ar-cancel { background: var(--accent); color: var(--accent-ink); border-color: transparent; }
+body.anchoring #ar-dots { display: none; }
 #ar-dots { display: flex; gap: 8px; }
-#ar-dots i { width: 10px; height: 10px; border-radius: 50%; background: rgba(255, 255, 255, .25); transition: background .15s, transform .15s; }
+#ar-dots i { width: 10px; height: 10px; border-radius: 50%; background: rgba(255, 255, 255, .35); box-shadow: 0 0 0 1px rgba(0, 0, 0, .35); transition: background .15s, transform .15s; }
 #ar-dots i.on { background: var(--accent); transform: scale(1.2); }
-body.selecting #toast { top: calc(var(--safe-t) + 122px); }
+#ui-layer .anchor-ring { fill: none; stroke: rgba(255, 255, 255, .9); stroke-width: 1.6; filter: drop-shadow(0 0 2px rgba(0, 0, 0, .8)); }
+#ui-layer .anchor-dot { fill: var(--accent); }
+/* уведомления на время выбора — над кнопками, а не сверху: верх экрана остаётся камере */
+body.selecting #toast, body.anchoring #toast { top: auto; bottom: calc(var(--safe-b) + 150px); }
+#btn-anchor.on { background: var(--accent); color: var(--accent-ink); }
 
 /* ---------- панели ---------- */
 .sheet {

@@ -6,13 +6,25 @@ const CV_URLS = [
   'https://unpkg.com/@techstark/opencv-js@4.10.0-release.1/dist/opencv.js',
 ];
 
-const PROC_MAX = 640; // длинная сторона кадра для анализа
+const PROC_LEVELS = [640, 576, 512, 448, 384, 320]; // длинная сторона кадра анализа: чем слабее телефон, тем меньше
+const FRAME_BUDGET_MS = 45;                          // на кадр трекинга хотим не больше (≈ 22 к/с)
+
+/**
+ * Выбор размера кадра анализа по замеру скорости (мс на синтетическом кадре 640×360, см. воркер).
+ * Полный трекинг стоит ≈ 1,3 замера; время почти пропорционально числу пикселей.
+ */
+export function pickProcMax(benchMs) {
+  if (!(benchMs > 0)) return PROC_LEVELS[0];
+  for (const L of PROC_LEVELS) if (1.3 * benchMs * (L / 640) ** 2 <= FRAME_BUDGET_MS) return L;
+  return PROC_LEVELS[PROC_LEVELS.length - 1];
+}
 
 export class ArTracker {
   constructor(video) {
     this.video = video;
     this.worker = null;
     this.readyPromise = null;
+    this.procMax = PROC_LEVELS[0];  // фиксируется замером при загрузке и не меняется за сессию (координаты воркера)
     this.canvas = document.createElement('canvas');
     this.ctx = this.canvas.getContext('2d', { willReadFrequently: true });
     this.pending = new Map();
@@ -39,6 +51,8 @@ export class ArTracker {
     this.readyPromise = this._call({ type: 'init', urls: CV_URLS }).then((r) => {
       this._ready = true;
       this.useBitmap = !!r.bitmap && typeof createImageBitmap === 'function';
+      this.benchMs = r.bench;
+      this.procMax = pickProcMax(r.bench);
       return r;
     });
     this.readyPromise.catch(() => { this.readyPromise = null; this.worker.terminate(); this.worker = null; });
@@ -64,7 +78,7 @@ export class ArTracker {
   /** Размер кадра анализа и точные коэффициенты «видео → кадр анализа». */
   get proc() {
     const { videoWidth: vw, videoHeight: vh } = this.video;
-    const s = Math.min(1, PROC_MAX / Math.max(vw, vh));
+    const s = Math.min(1, this.procMax / Math.max(vw, vh));
     const w = Math.max(16, Math.round(vw * s)), h = Math.max(16, Math.round(vh * s));
     return { w, h, sx: w / vw, sy: h / vh };
   }
@@ -142,6 +156,18 @@ export class ArTracker {
   async selBack() {
     const r = await this._call({ type: 'selBack' });
     return this._selPts(r.pts || []);
+  }
+
+  /** Точка опоры: неподвижный предмет рядом с холстом (координаты видео). Возвращает, сколько опор теперь у воркера. */
+  async addAnchor(pt) {
+    const r = await this._call({ type: 'addAnchor', point: this._toProc([pt])[0] });
+    return r.n;
+  }
+
+  /** Убрать последнюю точку опоры (all — все). */
+  async removeAnchor(all = false) {
+    const r = await this._call({ type: 'removeAnchor', all });
+    return r.n;
   }
 
   _selPts(pts) { return pts.map((pt) => ({ ...pt, p: this._fromProc([pt.p])[0] })); }
