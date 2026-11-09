@@ -31,7 +31,8 @@ async function run(scene, port) {
     const max = errs[errs.length - 1];
     const avgMs = Math.round(rs.reduce((s, x) => s + x.ms, 0) / rs.length);
     const line = `${name}: отслежено ${tr.length}/${rs.length}, ошибка мед. ${med ?? '—'} px, макс. ${max ?? '—'} px, ${avgMs} мс/кадр`;
-    if (medTol === null) check(tr.length === 0, line + ' — ожидается «потерян»');
+    // при закрытой камере трекер несколько кадров едет по инерции (чтобы не мигать при смазе), затем сообщает о потере
+    if (medTol === null) check(tr.length <= 8 && tr.length < rs.length, line + ' — инерция не дольше 8 кадров, затем «потерян»');
     else check(tr.length >= rs.length - 2 && med <= medTol && max <= maxTol, line);
   }
   if (scene === 'main') {

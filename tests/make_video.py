@@ -9,7 +9,8 @@ import sys
 import numpy as np
 from PIL import Image
 
-ROOT = os.path.join(os.path.dirname(os.path.abspath(__file__)), '.data', 'video')
+NAME = sys.argv[1] if len(sys.argv) > 1 else 'video'   # 'video' — холст, 'palm' — ладонь
+ROOT = os.path.join(os.path.dirname(os.path.abspath(__file__)), '.data', NAME)
 MOV = os.path.join(ROOT, 'training.mov')
 
 
@@ -20,6 +21,9 @@ def main():
     if not os.path.exists(os.path.join(ROOT, 'f001.png')):
         subprocess.check_call(['ffmpeg', '-v', 'error', '-y', '-i', MOV, '-vsync', '0', os.path.join(ROOT, 'f%03d.png')])
     names = sorted(n for n in os.listdir(ROOT) if n.startswith('f') and n.endswith('.png'))
+    if NAME != 'video':  # для e2e с фейковой камерой (штрихкод кадра) нужен только ролик с холстом
+        print('кадров', len(names))
+        return
     first = np.asarray(Image.open(os.path.join(ROOT, names[0])).convert('RGB'))
     h, w, _ = first.shape
     with open(os.path.join(ROOT, 'training.y4m'), 'wb') as f:

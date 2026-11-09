@@ -33,6 +33,10 @@ const CFG = {
   lkBackCheck: false,     // межкадровый поток — только прогноз, RANSAC и шаблон отсеют ошибки
   tmplBackCheck: true,    // защита от ложной позы (тёмный/закрытый кадр)
   tmplCorners: 160,       // точек в шаблоне для уточнения позы
+  wPersp: 0.6,            // вес штрафа за перспективу в оптимизаторе
+  coastMax: 8,            // сколько кадров подряд ехать по инерции при сбое, прежде чем объявить потерю
+  eccEvery: 8,            // как часто (в кадрах) выравнивать по заплатке, когда точек хватает (богатая фактура)
+  eccSparse: 70,          // меньше стольких точек потока — подключаем плотное выравнивание (ECC)
   minPointStd: 6,         // минимальный локальный контраст точки (уровней) — не цепляться за шум
   ransacRefine: 2.0,      // px
   minRefine: 10,
@@ -251,6 +255,23 @@ function plausible(Hm) {
   return q.every(([x, y]) => x > -lim && x < W + lim && y > -lim && y < H + lim);
 }
 
+/** Форма рамки не выродилась: не «щепка» и не сильно сплюснута по сравнению с моментом захвата. */
+function shapeOk(Hm) {
+  const q = mapQuad(Hm, st.quad);
+  const shape = (c) => {
+    const L = [0, 1, 2, 3].map((i) => Math.hypot(c[(i + 1) % 4][0] - c[i][0], c[(i + 1) % 4][1] - c[i][1]));
+    const ang = [0, 1, 2, 3].map((i) => {
+      const p = c[i], a = c[(i + 3) % 4], b = c[(i + 1) % 4];
+      const v1 = [a[0] - p[0], a[1] - p[1]], v2 = [b[0] - p[0], b[1] - p[1]];
+      return Math.acos(Math.max(-1, Math.min(1, (v1[0] * v2[0] + v1[1] * v2[1]) / ((Math.hypot(...v1) * Math.hypot(...v2)) || 1))));
+    });
+    return { ratio: Math.min(...L) / (Math.max(...L) || 1), minAng: Math.min(...ang) };
+  };
+  if (!st.shape0) st.shape0 = shape(st.quad);
+  const c = shape(q);
+  return c.ratio >= 0.4 * st.shape0.ratio && c.minAng >= Math.min(0.5, 0.45 * st.shape0.minAng);
+}
+
 function quadDist(H1, H2) {
   let s = 0;
   for (const [x, y] of st.quad) {
@@ -279,7 +300,7 @@ function currentMask(Hm) {
   return polyMask(mapQuad(Hm, st.searchQuad));
 }
 
-function detectCorners(img, mask, max, exclude) {
+function detectCorners(img, mask, max, exclude, imgNorm) {
   const m = mask.clone();
   if (exclude && exclude.length) {
     for (let i = 0; i < exclude.length; i += 2)
@@ -293,6 +314,18 @@ function detectCorners(img, mask, max, exclude) {
     if (localStd(img, c[i], c[i + 1]) >= CFG.minPointStd) out.push(c[i], c[i + 1]);
   }
   corners.delete(); m.delete();
+  // Малоконтрастная поверхность (кожа, бумага): угловых точек мало — добираем на кадре, нормализованном
+  // по локальному контрасту, с более мягкими порогами и меньшим расстоянием между точками
+  if (imgNorm && out.length / 2 < max * 0.5) {
+    const m2 = mask.clone();
+    const ex = (exclude || []).concat(out);
+    for (let i = 0; i < ex.length; i += 2) cv.circle(m2, new cv.Point(Math.round(ex[i]), Math.round(ex[i + 1])), 4, new cv.Scalar(0), -1);
+    const c2 = new cv.Mat();
+    cv.goodFeaturesToTrack(imgNorm, c2, Math.max(8, max - out.length / 2), 0.002, 4, m2, 5, false, 0.04);
+    const d = c2.data32F;
+    for (let i = 0; i < d.length; i += 2) if (localStd(imgNorm, d[i], d[i + 1]) >= 14) out.push(d[i], d[i + 1]);
+    c2.delete(); m2.delete();
+  }
   return out;
 }
 
@@ -359,8 +392,9 @@ function makeKeyframe(img, Hm, t) {
 function dropState() {
   if (!st) return;
   st.keyframes.forEach((k) => k.desc.delete());
-  if (st.tmpl) st.tmpl.img.delete();
-  st.tmpl = null;
+  if (st.tmpl) { st.tmpl.img.delete(); st.tmpl.crop.delete(); if (st.tmpl.ecc) st.tmpl.ecc.T.delete(); }
+  if (st.eccRecent) st.eccRecent.delete();
+  st.tmpl = null; st.eccRecent = null;
 }
 
 /** Сопоставление ORB текущего кадра с ключевыми кадрами. */
@@ -506,7 +540,7 @@ function seedPoints(Hm, keep) {
   const refPts = keep ? Array.from(st.ref) : [];
   const need = CFG.maxCorners - curPts.length / 2;
   if (need > 10) {
-    const fresh = detectCorners(gray, mask, need, curPts);
+    const fresh = detectCorners(gray, mask, need, curPts, norm);
     const inv = invertH(Hm);
     for (let i = 0; i < fresh.length; i += 2) {
       const r = applyH(inv, fresh[i], fresh[i + 1]);
@@ -545,14 +579,122 @@ function warpToRef(img, Hm) {
  * кадра, поэтому шаблон и текущий вид сравниваются в одинаковых условиях.
  */
 function setTemplate(rawRef, validMask) {
-  if (st.tmpl) st.tmpl.img.delete();
+  if (st.tmpl) { st.tmpl.img.delete(); st.tmpl.crop.delete(); if (st.tmpl.ecc) st.tmpl.ecc.T.delete(); }
   const mask = polyMask(st.fullFrame ? [[0, 0], [W, 0], [W, H], [0, H]] : st.searchQuad);
   if (validMask) cv.bitwise_and(mask, validMask, mask);
-  const pts = detectCorners(rawRef, mask, CFG.tmplCorners);
-  mask.delete();
   const img = new cv.Mat();
   normalize(rawRef, img);
-  st.tmpl = { img, pts: Float32Array.from(pts), n: pts.length / 2, low: 0 };
+  const pts = detectCorners(rawRef, mask, CFG.tmplCorners, null, img);
+  mask.delete();
+  // заплатка для плотного выравнивания: область холста в опорных координатах, уменьшенная до ECC.side
+  const box = eccBox();
+  const roi = rawRef.roi(new cv.Rect(box.x0, box.y0, box.bw, box.bh));
+  const T = new cv.Mat();
+  cv.resize(roi, T, new cv.Size(box.w, box.h), 0, 0, cv.INTER_AREA);
+  roi.delete();
+  // область, в которой считаются точки шаблона (меньше кадра — и разворот, и нормализация дешевле)
+  const tb = st.fullFrame ? { x0: 0, y0: 0, w: W, h: H } : boxOf(st.searchQuad, 0.1);
+  const crop = img.roi(new cv.Rect(tb.x0, tb.y0, tb.w, tb.h)).clone();
+  const loc = new Float32Array(pts.length);
+  for (let i = 0; i < pts.length; i += 2) { loc[i] = pts[i] - tb.x0; loc[i + 1] = pts[i + 1] - tb.y0; }
+  // фактура заплатки (СКО яркости после лёгкого сглаживания): на гладком листе ECC цепляется за шум
+  const sm = new cv.Mat(), mean = new cv.Mat(), sd = new cv.Mat();
+  cv.GaussianBlur(T, sm, new cv.Size(5, 5), 0);
+  const inner = cv.Mat.zeros(box.h, box.w, cv.CV_8UC1); // только внутри четырёхугольника, без фона вокруг
+  const flat = [];
+  for (const [x, y] of st.quad) flat.push(Math.round((x - box.x0) * box.s), Math.round((y - box.y0) * box.s));
+  const poly = cv.matFromArray(4, 1, cv.CV_32SC2, flat), mv = new cv.MatVector();
+  mv.push_back(poly);
+  cv.fillPoly(inner, mv, new cv.Scalar(255));
+  const ek = cv.getStructuringElement(cv.MORPH_RECT, new cv.Size(9, 9)); // отступ от границы: там перепад «холст/фон»
+  cv.erode(inner, inner, ek);
+  ek.delete();
+  cv.meanStdDev(sm, mean, sd, inner);
+  const texStd = sd.data64F[0];
+  mv.delete(); poly.delete(); inner.delete(); sm.delete(); mean.delete(); sd.delete();
+  st.tmpl = { img, crop, tb, loc, pts: Float32Array.from(pts), n: pts.length / 2, low: 0, ecc: { T, box, texStd } };
+}
+
+/** Целочисленная рамка вокруг четырёхугольника с запасом m (доля размера), в пределах кадра. */
+function boxOf(q, m) {
+  const xs = q.map((p) => p[0]), ys = q.map((p) => p[1]);
+  const mx = (Math.max(...xs) - Math.min(...xs)) * m, my = (Math.max(...ys) - Math.min(...ys)) * m;
+  const x0 = Math.max(0, Math.floor(Math.min(...xs) - mx)), y0 = Math.max(0, Math.floor(Math.min(...ys) - my));
+  const x1 = Math.min(W, Math.ceil(Math.max(...xs) + mx)), y1 = Math.min(H, Math.ceil(Math.max(...ys) + my));
+  return { x0, y0, w: Math.max(16, x1 - x0), h: Math.max(16, y1 - y0) };
+}
+
+// ---------- плотное выравнивание (ECC) ----------
+// Нужно там, где мало угловых точек: ладонь, пустая бумага, размытая картинка. ECC подбирает гомографию так,
+// чтобы ВСЯ заплатка (а не горстка точек) совпала с шаблоном по нормированной корреляции — яркость
+// не важна. Стартуем от предсказания потока, поэтому сходится за несколько итераций.
+const ECC = { side: 96, iters: 30, eps: 1e-3, gauss: 5, minCC: 0.7, lostCC: 0.8, recentCC: 0.6, recentEvery: 1, anchorEvery: 1, minTex: 4, suspect: 10 };
+
+/** «Свежая» заплатка: вид поверхности по текущей позе. Ведёт от кадра к кадру, пока вид меняется (поворот ладони). */
+function updateRecentEcc() {
+  const e = st.tmpl && st.tmpl.ecc;
+  if (!e) return;
+  const { box } = e, s = box.s;
+  const Tfi = invertH([s, 0, -box.x0 * s, 0, s, -box.y0 * s, 0, 0, 1]);
+  const Hmat = cv.matFromArray(3, 3, cv.CV_64F, mulH(st.H, Tfi));
+  const T = new cv.Mat();
+  cv.warpPerspective(gray, T, Hmat, new cv.Size(box.w, box.h), cv.INTER_LINEAR | cv.WARP_INVERSE_MAP, cv.BORDER_REPLICATE);
+  Hmat.delete();
+  if (st.eccRecent) st.eccRecent.delete();
+  st.eccRecent = T;
+}
+
+function eccBox() {
+  const xs = st.quad.map((p) => p[0]), ys = st.quad.map((p) => p[1]);
+  const mx = (Math.max(...xs) - Math.min(...xs)) * 0.06, my = (Math.max(...ys) - Math.min(...ys)) * 0.06;
+  const x0 = Math.max(0, Math.floor(Math.min(...xs) - mx)), y0 = Math.max(0, Math.floor(Math.min(...ys) - my));
+  const x1 = Math.min(W, Math.ceil(Math.max(...xs) + mx)), y1 = Math.min(H, Math.ceil(Math.max(...ys) + my));
+  const bw = Math.max(16, x1 - x0), bh = Math.max(16, y1 - y0);
+  const s = Math.min(1, ECC.side / Math.max(bw, bh));
+  return { x0, y0, bw, bh, s, w: Math.max(16, Math.round(bw * s)), h: Math.max(16, Math.round(bh * s)) };
+}
+
+/** Гомография «опорные → текущие координаты», уточнённая плотным выравниванием от предсказания Hm. */
+function eccRefine(Hm, Tpl, coarse, affine) {
+  const e = st.tmpl && st.tmpl.ecc;
+  if (!e) return null;
+  const { box } = e, s = box.s;
+  const Tf = [s, 0, -box.x0 * s, 0, s, -box.y0 * s, 0, 0, 1];   // опорные → координаты заплатки
+  const Tfi = invertH(Tf);
+  const Hmat = cv.matFromArray(3, 3, cv.CV_64F, mulH(Hm, Tfi));  // заплатка → текущий кадр
+  const U = new cv.Mat();
+  cv.warpPerspective(gray, U, Hmat, new cv.Size(box.w, box.h), cv.INTER_LINEAR | cv.WARP_INVERSE_MAP, cv.BORDER_REPLICATE);
+  const C = affine ? cv.Mat.eye(2, 3, cv.CV_32F) : cv.Mat.eye(3, 3, cv.CV_32F);
+  const motion = affine ? cv.MOTION_AFFINE : cv.MOTION_HOMOGRAPHY;
+  if (coarse) {
+    // от грубого к точному: на половинном масштабе ECC захватывает вдвое большее смещение
+    const T2 = new cv.Mat(), U2 = new cv.Mat(), C2 = affine ? cv.Mat.eye(2, 3, cv.CV_32F) : cv.Mat.eye(3, 3, cv.CV_32F);
+    const sz = new cv.Size(Math.max(16, box.w >> 1), Math.max(16, box.h >> 1));
+    cv.resize(Tpl || e.T, T2, sz, 0, 0, cv.INTER_AREA);
+    cv.resize(U, U2, sz, 0, 0, cv.INTER_AREA);
+    let cc2 = -1;
+    try { cc2 = cv.findTransformECC(T2, U2, C2, motion, new cv.TermCriteria(3, 50, 1e-3), new cv.Mat(), 3); } catch (err) { cc2 = -1; }
+    if (cc2 > 0.3) {
+      const sx = sz.width / box.w, sy = sz.height / box.h, Sf = [sx, 0, 0, 0, sy, 0, 0, 0, 1];
+      const c2 = Array.from(C2.data32F);
+      const Cf = mulH(invertH(Sf), mulH(c2.length === 6 ? c2.concat([0, 0, 1]) : c2, Sf));
+      C.data32F.set(c2.length === 6 ? Cf.slice(0, 6) : Cf);
+    }
+    T2.delete(); U2.delete(); C2.delete();
+  }
+  let cc = -1;
+  try {
+    cc = cv.findTransformECC(Tpl || e.T, U, C, motion, new cv.TermCriteria(3, ECC.iters, ECC.eps), new cv.Mat(), ECC.gauss);
+  } catch (err) { cc = -1; } // не сошлось
+  let res = null;
+  if (cc > 0) {
+    const cw = Array.from(C.data32F);
+    const Hn = mulH(Hm, mulH(Tfi, mulH(cw.length === 6 ? cw.concat([0, 0, 1]) : cw, Tf)));
+    const k = Hn[8];
+    res = { H: Hn.map((v) => v / k), cc };
+  }
+  Hmat.delete(); U.delete(); C.delete();
+  return res;
 }
 
 function updateTemplate() {
@@ -574,23 +716,31 @@ function templatePairs(Hm) {
   const t = st.tmpl;
   const res = { ref: [], cur: [], n: 0, ratio: 0 };
   if (!t || t.n < 4) return res;
-  const raw = warpToRef(gray, Hm);
+  // кадр разворачивается в опорные координаты только внутри рамки области шаблона
+  const { tb } = t;
+  const Hmat = cv.matFromArray(3, 3, cv.CV_64F, mulH(Hm, [1, 0, tb.x0, 0, 1, tb.y0, 0, 0, 1]));
+  const raw = new cv.Mat();
+  cv.warpPerspective(gray, raw, Hmat, new cv.Size(tb.w, tb.h), cv.INTER_LINEAR | cv.WARP_INVERSE_MAP, cv.BORDER_CONSTANT, new cv.Scalar(0));
+  Hmat.delete();
   const warped = new cv.Mat();
   normalize(raw, warped);
   raw.delete();
-  const { idx, out } = lkPairs(t.img, warped, t.pts, 15, 2, CFG.tmplBackCheck);
+  const { idx, out } = lkPairs(t.crop, warped, t.loc, 15, 2, CFG.tmplBackCheck);
   warped.delete();
   if (idx.length < 4) return res;
-  const src = [];
-  for (const i of idx) src.push(t.pts[i * 2], t.pts[i * 2 + 1]);
+  const src = [], dst = [];
+  for (let k = 0; k < idx.length; k++) {
+    src.push(t.pts[idx[k] * 2], t.pts[idx[k] * 2 + 1]);
+    dst.push(out[k * 2] + tb.x0, out[k * 2 + 1] + tb.y0);
+  }
   let mask = null;
   if (idx.length >= 8) {
-    const r = findH(src, out, CFG.ransacRefine, 500);
+    const r = findH(src, dst, CFG.ransacRefine, 500);
     if (r) mask = r.mask;
   }
   for (let i = 0; i < idx.length; i++) {
     if (mask && !mask[i]) continue;
-    const c = applyH(Hm, out[i * 2], out[i * 2 + 1]);
+    const c = applyH(Hm, dst[i * 2], dst[i * 2 + 1]);
     res.ref.push([src[i * 2], src[i * 2 + 1]]);
     res.cur.push(c);
   }
@@ -717,13 +867,19 @@ function optimize(Hinit, Hprior, pairs, edges) {
       const nx = -(B[1] - A[1]) / L, ny = (B[0] - A[0]) / L;
       for (const p of e.pts) r.push(wEdge * ((p[0] - A[0]) * nx + (p[1] - A[1]) * ny));
     }
+    // мягкая регуляризация: перспективные члены гомографии (знаменатель в углах рамки) тянем к 1. На малоконтрастной
+    // поверхности они почти не определяются данными и иначе дрейфуют — рамка сплющивается в «щепку». Когда точек
+    // много (холст), данные перевешивают этот штраф.
+    const size = Math.sqrt(Math.abs(quadArea(st.quad)));
+    const wp = st.lowTex ? CFG.wPersp : 0; // только когда данных мало (кожа, бумага); у холста данных хватает
+    for (const [cx, cy] of st.quad) r.push(wp * size * (Hx[6] * cx + Hx[7] * cy + Hx[8] - 1));
     for (let i = 0; i < 8; i++) r.push(wPrior * (xv[i] - prior[(i / 2) | 0][i % 2]));
     return r;
   };
 
   let r = residuals(x);
   if (!r) return { H: Hinit, rms: Infinity };
-  const m = r.length, nPrior = 8;
+  const m = r.length, nPrior = 12; // 4 перспективных + 8 априорных невязок идут без весов Хьюбера
   for (let iter = 0; iter < 6; iter++) {
     // веса Хьюбера (для априорных невязок вес 1)
     const w = r.map((v, i) => (i >= m - nPrior ? 1 : Math.abs(v) <= CFG.huber ? 1 : CFG.huber / Math.abs(v)));
@@ -821,12 +977,16 @@ function startTracking(quad, msg) {
     lastAgree: -1e9,
     lastKfT: now(),
     initialPts: 0,
+    shape0: null,
+    ancLow: 0,
+    Hgood: null,
   };
   learnEdges();
   seedPoints(st.H, false);
   st.initialPts = st.cur.length / 2;
   setTemplate(gray, null);
   st.keyframes.push(makeKeyframe(gray, st.H, now()));
+  updateRecentEcc();
   norm.copyTo(prevNorm);
   const kf = st.keyframes[0];
   const goodEdges = st.edges.filter((e) => e.use).length;
@@ -837,6 +997,7 @@ function startTracking(quad, msg) {
     features: kf.n,
     edges: goodEdges,
     weak: st.tmpl.n < 15 && goodEdges < 3,
+    eccStd: +st.tmpl.ecc.texStd.toFixed(1),
   };
 }
 
@@ -886,8 +1047,51 @@ function track(msg) {
   }
   lap('reloc');
 
+  // плотное выравнивание: сначала по «свежей» заплатке (держит при смене вида), затем по якорной
+  // (первый кадр — без дрейфа). Нужно, когда точек потока мало (кожа, бумага) или поза потеряна.
+  let ecc = null;
+  if (st.tmpl && st.tmpl.ecc && st.tmpl.ecc.texStd >= ECC.minTex && (wasLost || st.lowTex || st.cur.length / 2 < CFG.eccSparse || st.frame % CFG.eccEvery === 0)) {
+    const sane = (r) => r && plausible(r.H) && shapeOk(r.H) && quadDist(r.H, pred) < Math.max(W, H) * 0.15;
+    let rec = null;
+    if (st.eccRecent) {
+      rec = eccRefine(pred, st.eccRecent, wasLost || st.fail > 0, true);
+      if (rec && rec.cc >= ECC.recentCC && sane(rec)) { pred = rec.H; ecc = rec; source = 'ecc-rec'; } else rec = null;
+    }
+    // якорная заплатка снимает накопленный дрейф; пока «свежая» держит, хватает раза в несколько кадров
+    const anc = (!rec || wasLost || st.frame % ECC.anchorEvery === 0) ? eccRefine(pred, null, wasLost || st.fail > 0) : null;
+    if (anc && anc.cc >= (wasLost && !rec ? ECC.lostCC : ECC.minCC) && sane(anc)) {
+      pred = anc.H; ecc = anc; source = source === 'ecc-rec' ? 'ecc' : (wasLost ? 'ecc-reacq' : source + '+ecc');
+      st.ancLow = 0;
+      if (anc.cc >= 0.85) st.Hgood = anc.H.slice(); // последняя поза, в которой вид совпадал с эталоном
+    } else if (anc !== null || !rec) st.ancLow = (st.ancLow || 0) + 1;
+    // Самоконтроль: «свежая» заплатка может незаметно увести позу, пока якорная давно не сходится.
+    // Тогда пробуем перезахват по якорю от последней хорошей позы и от стартовой (ладонь часто возвращается).
+    if ((st.ancLow || 0) >= ECC.suspect && st.frame % 3 === 0) {
+      for (const Hc of [st.Hgood, I3()]) {
+        if (!Hc) continue;
+        const rr = eccRefine(Hc, null, true);
+        if (rr && rr.cc >= ECC.lostCC && plausible(rr.H) && shapeOk(rr.H)) {
+          pred = rr.H; ecc = rr; source = 'ecc-reloc'; st.ancLow = 0; st.Hgood = rr.H.slice();
+          break;
+        }
+      }
+    }
+  }
+  lap('ecc');
+
   // измерения без дрейфа
   const pairs = templatePairs(pred);
+  st.lowTex = pairs.n < 60; // мало опорных точек: кожа, пустая бумага — тогда выравниваем по заплатке каждый кадр
+  if (ecc) { // сетка точек по рамке, перенесённая по ECC-позе, — плотная опора для оптимизации
+    const q = st.quad, G = 5;
+    for (let i = 0; i < G; i++) for (let j = 0; j < G; j++) {
+      const u = i / (G - 1), v = j / (G - 1);
+      const rx = (1 - u) * ((1 - v) * q[0][0] + v * q[3][0]) + u * ((1 - v) * q[1][0] + v * q[2][0]);
+      const ry = (1 - u) * ((1 - v) * q[0][1] + v * q[3][1]) + u * ((1 - v) * q[1][1] + v * q[2][1]);
+      pairs.ref.push([rx, ry]); pairs.cur.push(applyH(ecc.H, rx, ry));
+    }
+    pairs.n = pairs.ref.length;
+  }
   lap('tmpl');
   const motion = quadDist(pred, Hprev);
   const radius = Math.round(Math.min(24, CFG.edgeRadius + (source === 'lk' ? 0 : motion * 0.5) + (wasLost ? 6 : 0)));
@@ -898,18 +1102,27 @@ function track(msg) {
   const nEdges = edges.length;
   // точки шаблона засчитываются, только если совпала заметная их доля (иначе это шум)
   const tmplOk = pairs.n >= CFG.minRefine && (pairs.ratio >= 0.12 || pairs.n >= 30);
-  const good = tmplOk || nEdges >= 3 || (nEdges >= 2 && pairs.n >= 4) ||
+  const good = tmplOk || !!ecc || nEdges >= 3 || (nEdges >= 2 && pairs.n >= 4) ||
     (!wasLost && lkInl >= 15 && pairs.n >= 4);
-  let state = 'lost', rms = 0;
+  let state = 'lost', rms = 0, accepted = null;
   if (good) {
     const opt = optimize(pred, pred, pairs, edges);
     rms = opt.rms;
-    if (plausible(opt.H) && opt.rms < 3) {
-      st.prevH = wasLost ? null : Hprev;
-      st.H = opt.H;
-      st.lost = 0;
-      state = 'tracking';
-    }
+    if (plausible(opt.H) && shapeOk(opt.H) && opt.rms < 3) accepted = opt.H;
+    else if (ecc && plausible(ecc.H) && shapeOk(ecc.H)) accepted = ecc.H; // оптимизация спорит с плотным выравниванием (мало точек) — верим ему
+  }
+  if (accepted) {
+    st.prevH = wasLost ? null : Hprev;
+    st.H = accepted;
+    st.lost = 0; st.fail = 0;
+    state = 'tracking';
+  } else if (!wasLost && (st.fail || 0) < CFG.coastMax && plausible(pred)) {
+    // кратковременный сбой (смаз, поза не сошлась): едем по инерции и пересеиваем точки, а не объявляем потерю
+    st.fail = (st.fail || 0) + 1;
+    st.prevH = st.fail > 1 ? null : Hprev; // экстраполяция по скорости — только первый кадр, дальше держим позу
+    st.H = pred;
+    state = 'tracking'; source = 'coast';
+    seedPoints(st.H, false);
   }
   lap('opt');
 
@@ -923,7 +1136,8 @@ function track(msg) {
     }
     // рисунок заметно изменился — обновляем шаблон
     st.tmpl.low = st.tmpl.n >= 8 && pairs.ratio < 0.4 ? st.tmpl.low + 1 : 0;
-    if (st.tmpl.low > 20 && st.stable > 5) updateTemplate();
+    if (st.tmpl.low > 20 && st.stable > 5 && !st.fail) updateTemplate();
+    if (st.tmpl && st.tmpl.ecc && !st.fail && st.frame % ECC.recentEvery === 0) updateRecentEcc(); // не запоминаем позу «по инерции»
     // новый ключевой кадр: позиция стабильна и недавно подтверждена ORB
     const t = now();
     if (st.stable > 8 && st.frame - st.lastAgree < CFG.relocEvery * 2 && t - st.lastKfT > CFG.keyframeEveryMs) {
@@ -949,6 +1163,7 @@ function track(msg) {
     inliers: lkInl,
     refined: pairs.n,
     edges: nEdges,
+    ecc: ecc ? +ecc.cc.toFixed(2) : 0,
     rms: +rms.toFixed(2),
     points: st.cur.length / 2,
     keyframes: st.keyframes.length,
@@ -1416,6 +1631,8 @@ function selUpdate() {
     }
     pt.miss = 0;
     const p = [out[k * 2], out[k * 2 + 1]];
+    // точка, которая угла не нашла (кожа, гладкая бумага), ведётся одним потоком — без привязки к углу
+    if (!pt.snapped) { pt.p = p; return; }
     const r = snapCorner(maps, p, [], { radius: SELT.snapRadius, rays: pt.rays, minScore: 0.35 });
     if (r.snapped && Math.hypot(r.p[0] - p[0], r.p[1] - p[1]) < SELT.maxJump) {
       pt.p = r.p; pt.rays = r.rays; pt.score = r.score; pt.fail = 0;
@@ -1463,7 +1680,14 @@ function selTap(msg) {
   if (sel.pts.length < 4) { selSwap(); return { type: 'tapped', snapped: r.snapped, p: outQuad([r.p])[0], pts: selOut() }; }
   // все 4 угла отмечены: рамка = упорядоченные точки, уточнённые по краям между ними
   const pts = sel.pts.map((pt) => pt.p);
-  const b = buildQuad(maps, pts, pts, 26); // допуск: на сколько рамка может уйти от отмеченных точек // допуск: на сколько рамка может уйти от отмеченных точек
+  // уточнять по краям есть смысл, только если углы найдены; иначе (ладонь, бумага) рамка — как отмечена
+  const snappedN = sel.pts.filter((pt) => pt.snapped).length;
+  let b;
+  if (snappedN >= 3) b = buildQuad(maps, pts, pts, 26); // допуск: на сколько рамка может уйти от отмеченных точек
+  else {
+    const o = orderQuad(pts);
+    b = convex(o) && Math.abs(quadArea(o)) > 0.002 * W * H ? { quad: o } : { quad: null };
+  } // допуск: на сколько рамка может уйти от отмеченных точек
   if (!b.quad) { selSwap(); return { type: 'tapped', snapped: r.snapped, p: outQuad([r.p])[0], pts: selOut(), badQuad: true }; }
   const lockInfo = startTracking(b.quad, msg); // копирует norm → prevNorm и сбрасывает sel
   return { ...lockInfo, type: 'locked', tapped: true, snapped: r.snapped, p: outQuad([r.p])[0] };
