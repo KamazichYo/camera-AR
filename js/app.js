@@ -1,13 +1,14 @@
 // ArtCam — камера художника: запись процесса, референс поверх холста, AR-привязка.
 import {
   IDENTITY, applyQuad, invert, cssMatrix3d, fitRect, fitIntoQuad, centroid, similarity,
-  isConvexQuad, QuadFilter, orderQuad, dist,
+  isConvexQuad, QuadKalman, orderQuad, dist,
 } from './geometry.js';
 import { Stage, QuadEditor } from './stage.js';
 import { Camera } from './camera.js';
 import { Recorder, findOrphans, removeRecordingFile, stamp } from './recorder.js';
 import { Reference } from './reference.js';
 import { ArTracker } from './tracker.js';
+import { SyncView } from './syncview.js';
 import { idbGet, idbSet, idbDel, loadSettings, saveSettings } from './storage.js';
 
 const $ = (s) => document.querySelector(s);
@@ -19,7 +20,7 @@ const DEFAULTS = {
   resolution: '1080', deviceId: null, facing: 'environment', fit: 'contain',
   mic: false, bitrate: 6_000_000,
   showCanvasFrame: true, surroundings: false, smoothing: 0.5,
-  wakeLock: true, stats: false,
+  wakeLock: true, stats: false, syncView: true,
   quadN: null,
 };
 const S = loadSettings(DEFAULTS);
@@ -33,6 +34,7 @@ const camera = new Camera(video);
 const recorder = new Recorder();
 const ref = new Reference();
 const tracker = new ArTracker(video);
+const sync = new SyncView(video, $('#view'));
 $('#world').appendChild(ref.canvas);
 
 let overlayQuad = null;            // рамка референса в координатах видео (без AR)
@@ -47,7 +49,10 @@ const ar = {
   lostSince: 0,
   info: null,
 };
-const filter = new QuadFilter();
+// Сглаживание поз: фильтр Калмана на каждый угол; показ — на времени показанного видеокадра
+const kfRef = new QuadKalman();     // рамка референса
+const kfCanvas = new QuadKalman();  // рамка холста (зелёная)
+const resetSmoothing = () => { kfRef.reset(); kfCanvas.reset(); sync.clearPoses(); };
 let editing = false;
 let displayQuad = null;
 
@@ -71,10 +76,14 @@ function toast(text, { action, onAction, ms = 3500 } = {}) {
 }
 
 function setFilterSmoothing() {
-  // 0 — без сглаживания (быстро, дрожит), 1 — максимально плавно
-  const k = S.smoothing;
-  const opts = { minCutoff: 6 - 5.4 * k, beta: 0.05 - 0.045 * k, dCutoff: 1 };
-  filter.f.forEach((f) => Object.assign(f, opts));
+  // 0 — отзывчиво (дрожит), 1 — максимально плавно. Параметры заданы для кадра шириной 480 px
+  // и масштабируются под размер видео.
+  const k = S.smoothing, sc = (video.videoWidth || 480) / 480;
+  for (const f of [kfRef, kfCanvas]) {
+    f.accel = 2400 * (1 - 0.8 * k) * sc;   // насколько резко может меняться движение
+    f.meas = 0.5 * sc;                      // шум измерения позы
+    f.gate = 40 * sc;                       // больший скачок — это перепривязка, а не шум
+  }
 }
 
 const fmtTime = (ms) => {
@@ -101,6 +110,8 @@ async function startCamera(opts = {}) {
   }
   if (ref.loaded && (!overlayQuad || !prev.w)) restoreQuad();
   lastDims = { w: video.videoWidth, h: video.videoHeight };
+  startShownClock();
+  setFilterSmoothing();
   updateCameraControls();
   requestWakeLock();
   if (wasAr) toast('Камера изменена — включите AR заново');
@@ -200,7 +211,7 @@ const overlayEditor = new QuadEditor(stage, {
   getQuad: () => (ref.loaded ? displayQuad || overlayQuad : null),
   setQuad: (q) => setOverlayQuad(q),
   onStart: () => { editing = true; overlayQuad = displayQuad || overlayQuad; },
-  onEnd: () => { editing = false; filter.reset(); ar.vel = null; ar.lastRaw = null; saveQuad(); },
+  onEnd: () => { editing = false; resetSmoothing(); saveQuad(); },
 });
 
 function updateEditors() {
@@ -234,6 +245,7 @@ async function arBegin() {
 // Углы отмечаются в любом порядке; после четвёртого рамка строится и AR стартует сам.
 let tapBusy = false;
 let lostWarned = false;
+let noCornerHinted = false;
 
 tracker.onSel = (pts, reset) => {
   if (ar.mode !== 'select' || tapBusy) return;
@@ -260,7 +272,10 @@ async function onCornerTap(sp) {
     if (r.locked) { onLocked(r.info); return; }
     ar.corners = r.pts;
     if (r.badQuad) toast('Эти точки не складываются в четырёхугольник. «Назад» — и отметьте угол заново.', { ms: 4500 });
-    else if (!r.snapped) toast('Угла не нашёл — поставил там, где нажали', { ms: 1800 });
+    else if (!r.snapped && !noCornerHinted) {
+      noCornerHinted = true; // один раз за выбор: на ладони или гладкой бумаге углов нет, и так задумано
+      toast('Угла рядом нет — точка остаётся там, где нажали. Для ладони и гладкой бумаги так и надо.', { ms: 3500 });
+    }
   } catch (e) {
     console.error(e);
     toast('Не удалось отметить угол: ' + e.message);
@@ -303,14 +318,15 @@ function onLocked(info) {
   const q = info.quad;
   ar.refCanvas = q;
   ar.H = IDENTITY;
-  ar.vel = null; ar.lastRaw = null;
   ar.state = 'tracking';
   ar.lostSince = 0;
   ar.corners = [];
   // референс сразу ложится на холст (его потом можно подвинуть)
   if (ref.loaded) { overlayQuad = fitIntoQuad(ref.aspect, q); S.visible = true; }
   ar.refOverlay = overlayQuad ? overlayQuad.map((p) => [...p]) : null;
-  filter.reset();
+  resetSmoothing();
+  setFilterSmoothing();
+  if (S.syncView) sync.start();
   ar.mode = 'tracking';
   updateArUi();
   if (info.weak) {
@@ -321,8 +337,10 @@ function onLocked(info) {
 function arStop(silent = false) {
   if (ar.mode === 'tracking' && displayQuad) overlayQuad = displayQuad.map((p) => [...p]);
   tracker.stop();
+  sync.stop();
+  document.body.classList.remove('synced');
   ar.mode = 'off';
-  ar.refCanvas = null; ar.refOverlay = null; ar.corners = []; ar.pendingTap = null; lostWarned = false;
+  ar.refCanvas = null; ar.refOverlay = null; ar.corners = []; ar.pendingTap = null; lostWarned = false; noCornerHinted = false;
   ar.H = IDENTITY;
   saveQuad();
   updateArUi();
@@ -333,26 +351,26 @@ tracker.onPose = (H, info, frameTime) => {
   if (ar.mode !== 'tracking') return;
   ar.info = info;
   if (info.state === 'tracking') {
-    // скорость углов референса (px/мс) — для компенсации задержки трекинга
-    if (ar.refOverlay) {
-      const raw = applyQuad(H, ar.refOverlay);
-      if (ar.state === 'tracking' && ar.lastRaw && frameTime > ar.poseT) {
-        const dt = frameTime - ar.poseT;
-        const v = raw.map((p, i) => [(p[0] - ar.lastRaw[i][0]) / dt, (p[1] - ar.lastRaw[i][1]) / dt]);
-        ar.vel = ar.vel ? ar.vel.map((o, i) => [o[0] * 0.4 + v[i][0] * 0.6, o[1] * 0.4 + v[i][1] * 0.6]) : v;
-      } else ar.vel = null;
-      ar.lastRaw = raw;
-    }
+    if (ar.state !== 'tracking') resetSmoothing(); // после потери поза могла «прыгнуть»
+    // поза относится к кадру, показанному в момент frameTime — в фильтр она идёт с этим временем
+    if (ar.refOverlay) kfRef.update(applyQuad(H, ar.refOverlay), frameTime);
+    if (ar.refCanvas) kfCanvas.update(applyQuad(H, ar.refCanvas), frameTime);
+    if (sync.active) sync.addPose(frameTime, H);
     ar.poseT = frameTime;
     ar.H = H;
-    if (ar.state !== 'tracking') filter.reset();
     ar.lostSince = 0;
-  } else {
-    ar.vel = null;
-    if (!ar.lostSince) ar.lostSince = performance.now();
-  }
+  } else if (!ar.lostSince) ar.lostSince = performance.now();
   if (ar.state !== info.state) { ar.state = info.state; updateArUi(); }
 };
+
+// Часы показанного видеокадра: референс рисуется на момент ЭТОГО кадра, поэтому между видеокадрами он
+// стоит на месте вместе с картинкой (а не «ползёт» с частотой отрисовки экрана).
+function startShownClock() {
+  if (!('requestVideoFrameCallback' in video) || startShownClock.on) return;
+  startShownClock.on = true;
+  const cb = (now, md) => { ar.shownT = (md && md.presentationTime) || now; video.requestVideoFrameCallback(cb); };
+  video.requestVideoFrameCallback(cb);
+}
 
 function updateArUi() {
   const pill = $('#ar-pill');
@@ -386,21 +404,25 @@ function frame(t) {
   requestAnimationFrame(frame);
   if (!video.videoWidth) return;
 
+  // Синхронный показ: выбираем кадр с небольшой задержкой и интерполируем позу между соседними обработанными
+  // кадрами — картинка и референс двигаются жёстко вместе. Без поддержки — фильтр Калмана на момент показанного кадра.
+  let syncT = null;
+  if (sync.active && ar.mode === 'tracking') {
+    syncT = sync.frame(t);
+    if (syncT !== null && !document.body.classList.contains('synced')) document.body.classList.add('synced');
+  }
+
   // рамка референса
+  let canvasQuad = null;
   if (ar.mode === 'tracking' && ar.refOverlay) {
     if (editing) displayQuad = overlayQuad;
     else {
-      let raw = applyQuad(ar.H, ar.refOverlay);
-      // Поза относится к кадру, показанному ar.poseT назад; на экране уже более новый кадр.
-      // Сдвигаем референс вперёд по оценённой скорости (не дальше 120 мс).
-      if (ar.vel && ar.state === 'tracking' && DEBUG.predict) {
-        const lead = Math.min(120, Math.max(0, t - ar.poseT));
-        const speed = Math.max(...ar.vel.map((v) => Math.hypot(v[0], v[1])));
-        // плавный порог: дрожание в покое не усиливается, движение компенсируется полностью
-        const k = Math.min(1, Math.max(0, (speed * lead - 0.8) / 2));
-        if (k > 0) raw = raw.map((p, i) => [p[0] + ar.vel[i][0] * lead * k, p[1] + ar.vel[i][1] * lead * k]);
+      if (syncT !== null) {
+        displayQuad = sync.quadAt(syncT, ar.refOverlay) || applyQuad(ar.H, ar.refOverlay);
+        canvasQuad = ar.refCanvas && sync.quadAt(syncT, ar.refCanvas);
+      } else {
+        displayQuad = kfRef.predict(ar.shownT || t, DEBUG.predict) || applyQuad(ar.H, ar.refOverlay);
       }
-      displayQuad = S.smoothing > 0 ? filter.filter(raw, t) : raw;
       overlayQuad = displayQuad;
     }
   } else displayQuad = overlayQuad;
@@ -436,7 +458,7 @@ function frame(t) {
     }
   }
   if (ar.mode === 'tracking' && S.showCanvasFrame && ar.refCanvas) {
-    const q = applyQuad(ar.H, ar.refCanvas);
+    const q = canvasQuad || kfCanvas.predict(ar.shownT || t, DEBUG.predict) || applyQuad(ar.H, ar.refCanvas);
     if (isConvexQuad(q)) svg += `<polygon class="canvas-frame ${ar.state}" points="${pts(q)}"/>`;
   }
   if (showRef && overlayEditor.enabled) {
@@ -451,7 +473,7 @@ function frame(t) {
   // статистика
   if (S.stats && ar.mode === 'tracking' && ar.info) {
     const i = ar.info;
-    $('#stats').textContent = `${tracker.stats.fps} к/с · ${i.ms} мс · точек ${i.points} · inl ${i.inliers} · kf ${i.keyframes} · ${i.source}`;
+    $('#stats').textContent = `${tracker.stats.fps} к/с · ${i.ms} мс · точек ${i.points} · inl ${i.inliers} · kf ${i.keyframes} · ${i.source}${sync.active ? ' · показ с задержкой ' + Math.round(sync.delay) + ' мс' : ''}`;
   } else $('#stats').textContent = '';
 
   // таймер записи
@@ -627,6 +649,7 @@ async function updateCameraControls() {
   $('#smoothing').value = Math.round(S.smoothing * 100);
   $('#wake').checked = S.wakeLock;
   $('#stats-toggle').checked = S.stats;
+  $('#sync-view').checked = S.syncView;
 }
 
 const escapeHtml = (s) => s.replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
@@ -670,8 +693,7 @@ function bind() {
     const q = displayQuad || overlayQuad;
     if (!q) return;
     setOverlayQuad(fn(q));
-    filter.reset();
-    ar.vel = null; ar.lastRaw = null;
+    resetSmoothing();
     saveQuad();
   };
   $('#btn-flip-h').onclick = () => editQuad((q) => [q[1], q[0], q[3], q[2]]);
@@ -743,6 +765,13 @@ function bind() {
     if (S.wakeLock) requestWakeLock(); else if (wakeLock) wakeLock.release();
   };
   $('#stats-toggle').onchange = (e) => { S.stats = e.target.checked; persist(); };
+  $('#sync-view').onchange = (e) => {
+    S.syncView = e.target.checked; persist();
+    if (ar.mode !== 'tracking') return;
+    if (S.syncView) sync.start();
+    else { sync.stop(); document.body.classList.remove('synced'); }
+    resetSmoothing();
+  };
   $('#btn-fullscreen').onclick = () => {
     if (document.fullscreenElement) document.exitFullscreen();
     else (document.documentElement.requestFullscreen || document.documentElement.webkitRequestFullscreen)?.call(document.documentElement).catch?.(() => {});
@@ -835,6 +864,6 @@ async function init() {
 }
 
 // для отладки и автотестов
-window.artcam = { S, ar, DEBUG, filter, onCornerTap, stage, tracker, camera, recorder, ref, get overlayQuad() { return overlayQuad; }, get displayQuad() { return displayQuad; }, arBegin, arStop, loadReference };
+window.artcam = { S, ar, DEBUG, sync, onCornerTap, resetSmoothing, stage, tracker, camera, recorder, ref, get overlayQuad() { return overlayQuad; }, get displayQuad() { return displayQuad; }, arBegin, arStop, loadReference };
 
 init();

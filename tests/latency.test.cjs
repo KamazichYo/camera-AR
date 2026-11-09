@@ -7,10 +7,15 @@ const { launch, check, DATA, frameIndex, waitFrame } = require('./common.cjs');
 
 const gt = JSON.parse(fs.readFileSync(path.join(DATA, 'main', 'gt.json'), 'utf8'));
 
-async function measure(p, predict, ms) {
-  await p.evaluate((v) => { window.artcam.DEBUG.predict = v; }, predict);
+async function measure(p, mode, ms) {
+  // 'sync' — синхронный показ (по умолчанию); 'kalman' — запасной режим: Калман + экстраполяция на момент показанного кадра
+  await p.evaluate((m) => {
+    const a = window.artcam;
+    if (m === 'kalman') { a.sync.stop(); document.body.classList.remove('synced'); a.resetSmoothing(); }
+  }, mode);
   return p.evaluate(async ({ ms, gt }) => {
-    const v = document.querySelector('#video');
+    const w = document.querySelector('#view');
+    const v = w && getComputedStyle(w).visibility === 'visible' ? w : document.querySelector('#video'); // что видит пользователь
     const c = document.createElement('canvas'); c.width = 80; c.height = 10;
     const ctx = c.getContext('2d', { willReadFrequently: true });
     const out = [];
@@ -62,21 +67,22 @@ function stats(rows, a, z) {
   }
   await p.waitForFunction(() => window.artcam.ar.mode === 'tracking', null, { timeout: 15000 });
   // референс ровно по холсту — его рамка на экране и есть измеряемая величина
-  await p.evaluate(() => { const a = window.artcam.ar; a.refOverlay = a.refCanvas.map((q) => [...q]); });
+  await p.evaluate(() => { const a = window.artcam.ar; a.refOverlay = a.refCanvas.map((q) => [...q]); window.artcam.resetSmoothing(); });
 
   const res = {};
-  for (const predict of [false, true]) {
-    const rows = await measure(p, predict, 13000);
-    res[predict] = { still: stats(rows, 1, 40), move: stats(rows, 45, 120), all: stats(rows, 1, 170) };
+  for (const mode of (process.env.MODES || 'sync,kalman').split(',')) {
+    const rows = await measure(p, mode, 13000);
+    res[mode] = { still: stats(rows, 1, 40), move: stats(rows, 45, 120) };
   }
   const fps = await p.evaluate(() => window.artcam.tracker.stats);
   const usedBitmap = await p.evaluate(() => window.artcam.tracker.useBitmap);
   await close();
   const f = (s) => `мед. ${s.med?.toFixed(2)} px, 90% ${s.p90?.toFixed(2)} px (n=${s.n})`;
   console.log(`трекинг ${fps.fps} к/с, ${fps.ms} мс/кадр; кадры в воркер через ImageBitmap: ${usedBitmap}`);
-  console.log(`  без прогноза: покой ${f(res.false.still)}; движение ${f(res.false.move)}`);
-  console.log(`  с прогнозом:  покой ${f(res.true.still)}; движение ${f(res.true.move)}`);
-  check(res.true.still.med < 1.5, 'в покое референс совпадает с холстом (< 1.5 px)');
-  check(res.true.move.med <= res.false.move.med, 'прогноз уменьшает отставание при движении');
+  console.log(`  синхронный показ:        покой ${f(res.sync.still)}; движение ${f(res.sync.move)}`);
+  console.log(`  запасной режим (Калман): покой ${f(res.kalman.still)}; движение ${f(res.kalman.move)}`);
+  check(res.sync.still.med < 1.0, 'в покое референс совпадает с холстом (< 1 px)');
+  check(res.sync.move.med < 1.0, 'при движении референс совпадает с холстом на экране (< 1 px)');
+  check(res.sync.move.med <= res.kalman.move.med, 'синхронный показ точнее запасного режима при движении');
   check(errors.length === 0, 'без ошибок в консоли ' + (errors.length ? JSON.stringify(errors) : ''));
 })().catch((e) => { console.error(e); process.exit(1); });

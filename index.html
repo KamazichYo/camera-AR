@@ -31,7 +31,7 @@
   </svg>
 
   <main id="stage">
-    <div id="world"><video id="video" playsinline muted autoplay></video></div>
+    <div id="world"><video id="video" playsinline muted autoplay></video><canvas id="view"></canvas></div>
     <svg id="ui-layer"></svg>
     <div id="flash"></div>
   </main>
@@ -189,6 +189,10 @@
     <div class="field inline">
       <label for="smoothing">Плавность</label>
       <input id="smoothing" type="range" min="0" max="100" step="1">
+    </div>
+    <div class="field inline">
+      <label for="sync-view">Синхронный показ<br><small class="muted">картинка идёт с задержкой ≈ 0,1 с, зато референс не дрожит и не отстаёт</small></label>
+      <input id="sync-view" type="checkbox" class="switch">
     </div>
     <div class="field inline">
       <label for="stats-toggle">Показывать статистику</label>

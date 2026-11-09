@@ -31,14 +31,14 @@ try {
       const r = await call({ type: 'selTap', point: taps[ti].p }, f);
       ti++;
       row.tap = { snapped: r.snapped, p: r.p };
-      if (r.type === 'locked') { mode = 'track'; quad0 = r.quad; row.locked = { quad: r.quad, points: r.points, edges: r.edges, weak: r.weak }; }
+      if (r.type === 'locked') { mode = 'track'; quad0 = r.quad; row.locked = { quad: r.quad, points: r.points, edges: r.edges, weak: r.weak, eccStd: r.eccStd }; }
       else row.pts = r.pts;
     } else if (mode === 'sel') {
       const r = await call({ type: 'frame' }, f);
       row.pts = r.pts;
     } else {
       const r = await call({ type: 'frame' }, f);
-      row.state = r.state; row.ms = r.ms; row.src = r.source;
+      row.state = r.state; row.ms = r.ms; row.src = r.source; row.ecc = r.ecc; row.pts = undefined; row.nl = r.points; row.rf = r.refined; row.prof = r.prof;
       row.quad = r.H && quad0 ? quad0.map((q) => ap(r.H, q)) : null;
     }
     row.dt = Math.round(performance.now() - t0);

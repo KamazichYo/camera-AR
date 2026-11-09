@@ -160,28 +160,53 @@ export function orderQuad(pts) {
   return [...sorted.slice(k), ...sorted.slice(0, k)];
 }
 
-/** One Euro Filter — сглаживание дрожания без большой задержки. */
-export class OneEuro {
-  constructor({ minCutoff = 1.2, beta = 0.01, dCutoff = 1 } = {}) {
-    Object.assign(this, { minCutoff, beta, dCutoff });
+/**
+ * Фильтр Калмана с постоянной скоростью для четырёх углов (8 независимых каналов).
+ * Позы приходят нерегулярно (~10–25 Гц, с шумом), а показывать нужно на моменте показанного видеокадра:
+ * update(q, t) вливает измерение, predict(t) отдаёт сглаженное положение на момент t — с экстраполяцией
+ * по оценённой скорости (не дальше maxLead мс, чтобы не «улетать», если позы перестали приходить).
+ *  accel — шум ускорения, px/с² (насколько резко может менять движение);
+ *  meas  — шум измерения позы, px.
+ */
+export class QuadKalman {
+  constructor({ accel = 1200, meas = 0.5, maxLead = 120, gate = 40 } = {}) {
+    Object.assign(this, { accel, meas, maxLead, gate });
     this.reset();
   }
-  reset() { this.x = null; this.dx = 0; this.t = 0; }
-  static alpha(cutoff, dt) { const r = 2 * Math.PI * cutoff * dt; return r / (r + 1); }
-  filter(v, t) {
-    if (this.x === null) { this.x = v; this.t = t; return v; }
-    const dt = Math.max(1e-3, (t - this.t) / 1000);
+  reset() { this.c = null; this.t = 0; }
+  update(q, t) {
+    const z = q.flat();
+    const R = this.meas * this.meas;
+    const init = () => { this.c = z.map((v) => ({ x: v, v: 0, p00: R, p01: 0, p11: 250000 })); this.t = t; };
+    if (!this.c || t - this.t > 400 || t <= this.t) return init();
+    const dt = (t - this.t) / 1000;
+    const qa = this.accel * this.accel;
+    // скачок позы (перепривязка трекера) — не сглаживаем, а принимаем как есть
+    let jump = false;
+    for (let k = 0; k < 8; k += 2) {
+      const c0 = this.c[k], c1 = this.c[k + 1];
+      if (Math.hypot(z[k] - (c0.x + c0.v * dt), z[k + 1] - (c1.x + c1.v * dt)) > this.gate) jump = true;
+    }
+    if (jump) return init();
+    this.c.forEach((c, k) => {
+      const x1 = c.x + c.v * dt;
+      const P00 = c.p00 + 2 * dt * c.p01 + dt * dt * c.p11 + qa * dt ** 4 / 4;
+      const P01 = c.p01 + dt * c.p11 + qa * dt ** 3 / 2;
+      const P11 = c.p11 + qa * dt * dt;
+      const S = P00 + R, K0 = P00 / S, K1 = P01 / S, y = z[k] - x1;
+      c.x = x1 + K0 * y;
+      c.v += K1 * y;
+      c.p00 = (1 - K0) * P00;
+      c.p01 = (1 - K0) * P01;
+      c.p11 = P11 - K1 * P01;
+    });
     this.t = t;
-    const dx = (v - this.x) / dt;
-    this.dx += OneEuro.alpha(this.dCutoff, dt) * (dx - this.dx);
-    const cutoff = this.minCutoff + this.beta * Math.abs(this.dx);
-    this.x += OneEuro.alpha(cutoff, dt) * (v - this.x);
-    return this.x;
   }
-}
-
-export class QuadFilter {
-  constructor(opts) { this.f = Array.from({ length: 8 }, () => new OneEuro(opts)); }
-  reset() { this.f.forEach((f) => f.reset()); }
-  filter(q, t) { return q.map((p, i) => [this.f[i * 2].filter(p[0], t), this.f[i * 2 + 1].filter(p[1], t)]); }
+  /** Положение углов на момент t (мс). extrapolate=false — без экстраполяции по скорости. */
+  predict(t, extrapolate = true) {
+    if (!this.c) return null;
+    const lead = extrapolate ? Math.min(this.maxLead, Math.max(0, t - this.t)) / 1000 : 0;
+    const o = this.c.map((c) => c.x + c.v * lead);
+    return [[o[0], o[1]], [o[2], o[3]], [o[4], o[5]], [o[6], o[7]]];
+  }
 }
