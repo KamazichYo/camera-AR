@@ -1,6 +1,7 @@
 // Сквозной тест интерфейса с фейковой камерой.
 const path = require('path');
-const { launch, check, DATA } = require('./common.cjs');
+const fs = require('fs');
+const { launch, check, DATA, frameIndex, waitFrame } = require('./common.cjs');
 
 (async () => {
   const { page: p, errors, close, url } = await launch({ port: 8792, camera: true, viewport: { width: 1000, height: 640 } });
@@ -57,11 +58,26 @@ const { launch, check, DATA } = require('./common.cjs');
   await p.waitForFunction(() => window.artcam.ref.loaded && window.artcam.overlayQuad);
   check(JSON.stringify(await q()) === before, 'референс и его положение восстановлены после перезагрузки');
 
-  // AR
+  // AR: кадр замирает, касаемся 4 углов листа (в случайном порядке, «неточным пальцем»)
+  const gtAll = JSON.parse(fs.readFileSync(path.join(DATA, 'main', 'gt.json'), 'utf8'));
+  await waitFrame(p, 1, 8); // начинаем в неподвижной фазе сцены: пока грузится AR-модуль, кадры идут ещё ~1 с
   await p.click('#btn-ar');
   await p.waitForFunction(() => window.artcam.ar.mode === 'select', null, { timeout: 60000 });
-  await p.waitForTimeout(600);
+  check(await p.evaluate(() => document.querySelector('#video').paused), 'кадр замер на время выбора углов');
+  const gtq = gtAll[await frameIndex(p)].q;
+  const jit = [[7, -5], [-6, 8], [5, 6], [-8, -4]];
+  let n = 0;
+  for (const i of [1, 3, 0, 2]) {
+    const [sx, sy] = await p.evaluate((pt) => window.artcam.stage.toScreen(pt), [gtq[i][0] + jit[n][0], gtq[i][1] + jit[n][1]]);
+    await p.mouse.click(sx, sy);
+    await p.waitForFunction((k) => window.artcam.ar.corners.length === k && window.artcam.ar.corners.every((c) => !c.pending), ++n, { timeout: 15000 });
+  }
+  await p.waitForFunction(() => !!window.artcam.ar.selectQuad, null, { timeout: 15000 });
+  await p.waitForTimeout(100);
   await shot('ar-select');
+  const sq = await p.evaluate(() => window.artcam.ar.selectQuad);
+  const qerr = Math.min(...[0, 1, 2, 3].map((s) => sq.reduce((a, pt, i) => a + Math.hypot(pt[0] - gtq[(i + s) % 4][0], pt[1] - gtq[(i + s) % 4][1]), 0) / 4));
+  check(qerr < 1.5, `рамка по касаниям совпадает с листом (ошибка ${qerr.toFixed(2)} px при неточных касаниях)`);
   await p.click('#ar-start');
   await p.waitForFunction(() => window.artcam.ar.mode === 'tracking', null, { timeout: 10000 });
   let tracked = 0;

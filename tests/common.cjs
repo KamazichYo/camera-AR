@@ -34,4 +34,18 @@ if (!fs.existsSync(path.join(DATA, 'main', 'gt.json'))) {
   process.exit(1);
 }
 
-module.exports = { launch, check, DATA };
+/** Номер кадра сцены main, зашитый штрихкодом (10 бит) в левый нижний угол видео 640×360. */
+const IDX_SRC = `(() => {
+  const v = document.querySelector('#video');
+  const c = document.createElement('canvas'); c.width = 80; c.height = 10;
+  const ctx = c.getContext('2d'); ctx.drawImage(v, 0, 350, 80, 10, 0, 0, 80, 10);
+  const d = ctx.getImageData(0, 0, 80, 10).data;
+  let idx = 0;
+  for (let i = 0; i < 10; i++) if (d[(5 * 80 + 8 * i + 4) * 4] > 128) idx |= 1 << i;
+  return idx;
+})()`;
+const frameIndex = (page) => page.evaluate(IDX_SRC);
+/** Дождаться, пока сцена окажется в «чистой» фазе (кадры a..b): выбор углов начинаем оттуда. */
+const waitFrame = (page, a, b) => page.waitForFunction(`(() => { const i = ${IDX_SRC}; return i >= ${a} && i <= ${b}; })()`, null, { polling: 15, timeout: 30000 });
+
+module.exports = { launch, check, DATA, frameIndex, waitFrame };

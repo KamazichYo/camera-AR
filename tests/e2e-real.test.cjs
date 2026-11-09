@@ -1,6 +1,6 @@
 // Сквозной сценарий на реальной фотографии мольберта (tests/.data/real, локально):
-// камера показывает фото → AR → «Найти» → рамка на холсте, углы доступны для захвата,
-// повторное «Найти» меняет вариант → «Отслеживать» работает.
+// камера показывает фото → AR → кадр замирает → касания по 4 углам холста в случайном порядке
+// и с «неточным пальцем» → рамка строится сама → «Назад» → «Отслеживать».
 const fs = require('fs');
 const path = require('path');
 const { chromium } = require('playwright');
@@ -15,7 +15,7 @@ const CV = require.resolve('@techstark/opencv-js/dist/opencv.js');
 (async () => {
   const srv = await serve(8803);
   const b = await chromium.launch({ args: ['--use-fake-ui-for-media-stream', '--use-fake-device-for-media-stream', `--use-file-for-fake-video-capture=${path.join(REAL, 'easel.y4m')}`] });
-  const ctx = await b.newContext({ viewport: { width: 414, height: 860 }, permissions: ['camera'] });
+  const ctx = await b.newContext({ viewport: { width: 414, height: 860 }, permissions: ['camera'], hasTouch: true });
   await ctx.route(/opencv-js@[\d.]+-release\.\d+\/dist\/opencv\.js/, (r) => r.fulfill({ body: fs.readFileSync(CV), contentType: 'text/javascript' }));
   const p = await ctx.newPage();
   const errors = [];
@@ -30,35 +30,58 @@ const CV = require.resolve('@techstark/opencv-js/dist/opencv.js');
 
   await p.click('#btn-ar');
   await p.waitForFunction(() => window.artcam.ar.mode === 'select', null, { timeout: 60000 });
-  await p.waitForTimeout(1200); // авто-поиск при входе в режим выбора
-  const q1 = await p.evaluate(() => window.artcam.ar.selectQuad.map((q) => [...q]));
+  check(await p.evaluate(() => document.querySelector('#video').paused), 'кадр замер на время выбора углов');
+  check((await p.textContent('#ar-hint')).includes('Нажмите на углы холста'), 'подсказка — только «Нажмите на углы холста»');
+  check(await p.isDisabled('#ar-start'), '«Отслеживать» недоступно, пока углы не отмечены');
+
+  const screen = (pt) => p.evaluate((x) => window.artcam.stage.toScreen(x), pt);
   const diag = Math.hypot(cam.w, cam.h);
-  const err = (q, gt) => q.reduce((s, pt, i) => s + Math.hypot(pt[0] - gt[i][0], pt[1] - gt[i][1]), 0) / 4;
-  const e1 = err(q1, cam.gt);
+  // допустимы оба контура холста: границы живописи и холст с полями
+  const cornerErr = (pt, i) => Math.min(Math.hypot(pt[0] - cam.paint[i][0], pt[1] - cam.paint[i][1]), Math.hypot(pt[0] - cam.gt[i][0], pt[1] - cam.gt[i][1]));
+  const err = (q) => Math.min(...[0, 1, 2, 3].map((s) => q.reduce((a, pt, i) => a + cornerErr(pt, (i + s) % 4), 0) / 4));
+
+  // касания «неточным пальцем» (до ~12 px в кадре ≈ 14 экранных), углы — в случайном порядке: 2, 0, 3, 1
+  const jitter = [[9, -6], [-7, 10], [6, 8], [-10, -5]];
+  const order = [2, 0, 3, 1];
+  let k = 0;
+  for (const i of order) {
+    const [sx, sy] = await screen([cam.paint[i][0] + jitter[k][0], cam.paint[i][1] + jitter[k][1]]);
+    await p.touchscreen.tap(sx, sy);
+    await p.waitForFunction((n) => window.artcam.ar.corners.length === n && window.artcam.ar.corners.every((c) => !c.pending), ++k, { timeout: 15000 });
+    if (k === 2) {
+      const n = await p.evaluate(() => document.querySelectorAll('#ar-dots i.on').length);
+      check(n === 2, 'счётчик показывает отмеченные углы (2 из 4)');
+      await p.screenshot({ path: path.join(REAL, 'e2e-real-taps.png') });
+    }
+  }
+  await p.waitForFunction(() => !!window.artcam.ar.selectQuad, null, { timeout: 15000 });
+  const q1 = await p.evaluate(() => window.artcam.ar.selectQuad.map((q) => [...q]));
+  const e1 = err(q1);
   await p.screenshot({ path: path.join(REAL, 'e2e-real-select.png') });
-  check(e1 / diag < 0.03, `после входа в AR рамка уже на холсте (ошибка ${e1.toFixed(1)} px из ${Math.round(diag)}, ${(100 * e1 / diag).toFixed(1)}%)`);
+  check(e1 / diag < 0.02, `рамка построена по касаниям (ошибка ${e1.toFixed(1)} px из ${Math.round(diag)}, ${(100 * e1 / diag).toFixed(1)}%)`);
+  check((await p.textContent('#ar-hint')).includes('Всё верно'), 'после 4 углов — «Всё верно?»');
+  check(!(await p.isDisabled('#ar-start')), '«Отслеживать» доступно');
 
-  const inView = await p.evaluate(() => {
-    const { stage, ar } = window.artcam;
-    return ar.selectQuad.every((pt) => { const [x, y] = stage.toScreen(pt); return x >= 14 && y >= 14 && x <= stage.cw - 14 && y <= stage.ch - 14; });
-  });
-  check(inView, 'все 4 угла рамки в видимой области — их можно ухватить пальцем');
-
-  await p.click('#ar-auto');
-  await p.waitForTimeout(400);
+  // «Назад»: рамка снимается, последний угол убирается; повторное касание достраивает её
+  await p.click('#ar-back');
+  check(await p.evaluate(() => !window.artcam.ar.selectQuad && window.artcam.ar.corners.length === 3), '«Назад» убирает последний угол и рамку');
+  const [rx, ry] = await screen([cam.paint[1][0] + 5, cam.paint[1][1] + 7]);
+  await p.touchscreen.tap(rx, ry);
+  await p.waitForFunction(() => !!window.artcam.ar.selectQuad, null, { timeout: 15000 });
   const q2 = await p.evaluate(() => window.artcam.ar.selectQuad.map((q) => [...q]));
-  const e2 = err(q2, cam.gt);
-  check(q2.some((pt, i) => Math.hypot(pt[0] - q1[i][0], pt[1] - q1[i][1]) > 1) || e2 < 1, 'повторное «Найти» показывает следующий вариант');
-  await p.click('#ar-auto'); await p.click('#ar-auto'); await p.click('#ar-auto'); // по кругу назад к первому
-  await p.waitForTimeout(300);
-  const q3 = await p.evaluate(() => window.artcam.ar.selectQuad.map((q) => [...q]));
-  check(err(q3, q1) < 1, 'варианты перебираются по кругу');
+  check(err(q2) / diag < 0.02, `после повторного касания рамка снова построена (ошибка ${err(q2).toFixed(1)} px)`);
+
+  // касание вне 4 отмеченных не добавляет пятого угла
+  const before = await p.evaluate(() => window.artcam.ar.corners.length);
+  await p.touchscreen.tap(60, 700);
+  check((await p.evaluate(() => window.artcam.ar.corners.length)) === before, 'лишние касания после 4 углов игнорируются');
 
   await p.click('#ar-start');
   await p.waitForFunction(() => window.artcam.ar.mode === 'tracking', null, { timeout: 15000 });
   await p.waitForTimeout(2500);
-  const st = await p.evaluate(() => ({ state: window.artcam.ar.state, info: window.artcam.ar.info }));
+  const st = await p.evaluate(() => ({ state: window.artcam.ar.state, info: window.artcam.ar.info, paused: document.querySelector('#video').paused }));
   await p.screenshot({ path: path.join(REAL, 'e2e-real-tracking.png') });
+  check(!st.paused, 'видео снова идёт');
   check(st.state === 'tracking', `трекинг стартовал (точек ${st.info && st.info.points}, краёв ${st.info && st.info.edges}, шаблон ${st.info && st.info.refined})`);
   check(errors.length === 0, 'без ошибок в консоли ' + (errors.length ? JSON.stringify(errors.slice(0, 3)) : ''));
   await b.close(); srv.close();
