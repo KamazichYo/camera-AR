@@ -50,14 +50,17 @@ function stats(rows, a, z) {
   await p.waitForFunction(() => document.querySelector('#video').videoWidth > 0);
   await p.setInputFiles('#file', path.join(DATA, 'ref.png'));
   await p.waitForFunction(() => window.artcam.ref.loaded);
-  await waitFrame(p, 1, 8); // кадр замрёт в неподвижной фазе сцены
+  await waitFrame(p, 1, 8); // выбор углов начинаем в неподвижной фазе сцены (кадры 0–40)
   await p.evaluate(() => window.artcam.arBegin());
   await p.waitForFunction(() => window.artcam.ar.mode === 'select', null, { timeout: 60000 });
-  // кадр замер на время выбора углов; рамка = истинное положение листа на этом кадре
-  const idx0 = await frameIndex(p);
-  await p.evaluate((q) => { window.artcam.ar.selectQuad = q; }, gt[idx0].q);
-  await p.evaluate(() => window.artcam.arStart());
-  await p.waitForFunction(() => window.artcam.ar.mode === 'tracking');
+  // касаемся 4 углов листа на живом видео (точно в углы) — AR включается сам
+  for (let n = 0; n < 4; n++) {
+    const q = gt[await frameIndex(p)].q;
+    const [sx, sy] = await p.evaluate((pt) => window.artcam.stage.toScreen(pt), q[[0, 1, 2, 3][n]]);
+    await p.mouse.click(sx, sy);
+    if (n < 3) await p.waitForFunction((k) => window.artcam.ar.corners.length === k && !window.artcam.ar.pendingTap, n + 1, { timeout: 15000 });
+  }
+  await p.waitForFunction(() => window.artcam.ar.mode === 'tracking', null, { timeout: 15000 });
   // референс ровно по холсту — его рамка на экране и есть измеряемая величина
   await p.evaluate(() => { const a = window.artcam.ar; a.refOverlay = a.refCanvas.map((q) => [...q]); });
 

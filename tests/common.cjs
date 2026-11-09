@@ -7,10 +7,10 @@ const DATA = path.join(__dirname, '.data');
 const CV_LOCAL = require.resolve('@techstark/opencv-js/dist/opencv.js');
 
 /** Браузер с фейковой камерой; OpenCV.js с CDN подменяется локальной копией из node_modules. */
-async function launch({ port, viewport = { width: 420, height: 860 }, camera = false }) {
+async function launch({ port, viewport = { width: 420, height: 860 }, camera = false, video = null }) {
   const srv = await serve(port);
   const args = camera ? ['--use-fake-ui-for-media-stream', '--use-fake-device-for-media-stream',
-    `--use-file-for-fake-video-capture=${path.join(DATA, 'fake.y4m')}`] : [];
+    `--use-file-for-fake-video-capture=${video || path.join(DATA, 'fake.y4m')}`] : [];
   const browser = await chromium.launch({ args });
   const ctx = await browser.newContext({ viewport, permissions: camera ? ['camera'] : [] });
   const cv = fs.readFileSync(CV_LOCAL);

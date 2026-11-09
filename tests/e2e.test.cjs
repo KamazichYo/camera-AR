@@ -58,28 +58,36 @@ const { launch, check, DATA, frameIndex, waitFrame } = require('./common.cjs');
   await p.waitForFunction(() => window.artcam.ref.loaded && window.artcam.overlayQuad);
   check(JSON.stringify(await q()) === before, 'референс и его положение восстановлены после перезагрузки');
 
-  // AR: кадр замирает, касаемся 4 углов листа (в случайном порядке, «неточным пальцем»)
+  // AR: на живом видео касаемся 4 углов листа (в случайном порядке, «неточным пальцем»);
+  // после четвёртого AR включается сам
   const gtAll = JSON.parse(fs.readFileSync(path.join(DATA, 'main', 'gt.json'), 'utf8'));
-  await waitFrame(p, 1, 8); // начинаем в неподвижной фазе сцены: пока грузится AR-модуль, кадры идут ещё ~1 с
+  await waitFrame(p, 1, 8); // начинаем в неподвижной фазе сцены (кадры 0–40): пока грузится AR-модуль, кадры идут ещё ~1 с
   await p.click('#btn-ar');
   await p.waitForFunction(() => window.artcam.ar.mode === 'select', null, { timeout: 60000 });
-  check(await p.evaluate(() => document.querySelector('#video').paused), 'кадр замер на время выбора углов');
-  const gtq = gtAll[await frameIndex(p)].q;
+  check(!(await p.evaluate(() => document.querySelector('#video').paused)), 'видео не замирает во время выбора углов');
   const jit = [[7, -5], [-6, 8], [5, 6], [-8, -4]];
-  let n = 0;
+  let n = 0, idx = 0;
   for (const i of [1, 3, 0, 2]) {
+    idx = await frameIndex(p);
+    const gtq = gtAll[idx].q;
     const [sx, sy] = await p.evaluate((pt) => window.artcam.stage.toScreen(pt), [gtq[i][0] + jit[n][0], gtq[i][1] + jit[n][1]]);
     await p.mouse.click(sx, sy);
-    await p.waitForFunction((k) => window.artcam.ar.corners.length === k && window.artcam.ar.corners.every((c) => !c.pending), ++n, { timeout: 15000 });
+    n++;
+    if (n < 4) {
+      await p.waitForFunction((k) => window.artcam.ar.corners.length === k && !window.artcam.ar.pendingTap, n, { timeout: 15000 });
+      if (n === 2) await shot('ar-two-points');
+    }
   }
-  await p.waitForFunction(() => !!window.artcam.ar.selectQuad, null, { timeout: 15000 });
-  await p.waitForTimeout(100);
+  await p.waitForFunction(() => window.artcam.ar.mode === 'tracking', null, { timeout: 15000 });
+  const lockIdx = await frameIndex(p);
   await shot('ar-select');
-  const sq = await p.evaluate(() => window.artcam.ar.selectQuad);
-  const qerr = Math.min(...[0, 1, 2, 3].map((s) => sq.reduce((a, pt, i) => a + Math.hypot(pt[0] - gtq[(i + s) % 4][0], pt[1] - gtq[(i + s) % 4][1]), 0) / 4));
-  check(qerr < 1.5, `рамка по касаниям совпадает с листом (ошибка ${qerr.toFixed(2)} px при неточных касаниях)`);
-  await p.click('#ar-start');
-  await p.waitForFunction(() => window.artcam.ar.mode === 'tracking', null, { timeout: 10000 });
+  const sq = await p.evaluate(() => window.artcam.ar.refCanvas);
+  // рамка относится к кадру, который воркер получил в момент 4-го касания (±1–2 кадра от текущего)
+  const qerr = Math.min(...[-3, -2, -1, 0, 1].map((d) => {
+    const g = gtAll[Math.max(0, lockIdx + d)].q;
+    return Math.min(...[0, 1, 2, 3].map((s) => sq.reduce((a, pt, i) => a + Math.hypot(pt[0] - g[(i + s) % 4][0], pt[1] - g[(i + s) % 4][1]), 0) / 4));
+  }));
+  check(qerr < 2, `после 4-го касания AR включился сам, рамка на листе (ошибка ${qerr.toFixed(2)} px при неточных касаниях)`);
   let tracked = 0;
   for (let i = 0; i < 10; i++) {
     await p.waitForTimeout(400);

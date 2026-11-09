@@ -1,5 +1,6 @@
 <!doctype html><body><script type="module">
-// Притягивание касаний к углам на одном изображении. ?img=...&taps=[[x,y],...] (пиксели исходного изображения)
+// Выбор углов касаниями на одном (неподвижном) изображении: тот же путь, что в приложении —
+// selStart → selTap ×4 → автозапуск трекинга. ?img=...&taps=[[x,y],...] (пиксели исходного изображения)
 const P = new URLSearchParams(location.search);
 const CV = 'https://cdn.jsdelivr.net/npm/@techstark/opencv-js@4.10.0-release.1/dist/opencv.js';
 const img = new Image(); img.src = P.get('img'); await img.decode();
@@ -16,17 +17,15 @@ const call = (m) => new Promise((res, rej) => { const i = ++id; pend.set(i, { re
 const sc = (p) => [p[0] * s, p[1] * s], un = (p) => [p[0] / s, p[1] / s];
 try {
   await call({ type: 'init', urls: [CV] });
-} catch {}
-try {
-  const out = [], pts = [];
+  await call({ type: 'selStart' });
+  const snaps = []; let quad = null;
   const t0 = performance.now();
   for (const t of taps) {
-    const r = await call({ type: 'snap', point: sc(t), others: pts.map(sc) });
-    out.push({ snapped: r.snapped, score: r.score, p: un(r.p) });
-    pts.push(un(r.p));
+    const r = await call({ type: 'selTap', point: sc(t) });
+    snaps.push({ snapped: r.snapped, p: un(r.p) });
+    if (r.type === 'locked') quad = r.quad.map(un);
+    await call({ type: 'frame' }); // кадр между касаниями (камера идёт)
   }
-  const ms = (performance.now() - t0) / taps.length;
-  const q = pts.length === 4 ? await call({ type: 'quad', taps: taps.map(sc), snapped: pts.map(sc), second: P.get('second') !== '0' }) : null;
-  window.result = { snaps: out, corners: q && q.corners && q.corners.map(un), quad: q && q.quad && q.quad.map(un), refined: q && q.refined, ms, size: [img.width, img.height] };
+  window.result = { snaps, quad, ms: (performance.now() - t0) / taps.length, size: [img.width, img.height] };
 } catch (e) { window.result = { error: String(e && e.message || e) }; }
 </script>

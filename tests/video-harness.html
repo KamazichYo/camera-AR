@@ -1,0 +1,49 @@
+<!doctype html><body><script type="module">
+// Прогон реального видео (кадры tests/.data/video/fNNN.png) через воркер так, как это делает приложение:
+// живой выбор углов касаниями → автостарт трекинга холста. Параметры: ?taps=[{f:кадр,p:[x,y]},...]&step=1
+const P = new URLSearchParams(location.search);
+const CV = 'https://cdn.jsdelivr.net/npm/@techstark/opencv-js@4.10.0-release.1/dist/opencv.js';
+const taps = JSON.parse(P.get('taps') || '[]');
+const step = +(P.get('step') || 1), N = +(P.get('n') || 161);
+const dir = P.get('dir') || '/t/.data/video';
+const w = new Worker('/app/js/tracker.worker.js');
+let id = 0; const pend = new Map();
+w.onmessage = (e) => { const p = pend.get(e.data.id); pend.delete(e.data.id); e.data.type === 'error' ? p.rej(new Error(e.data.message)) : p.res(e.data); };
+const c = document.createElement('canvas'); const ctx = c.getContext('2d', { willReadFrequently: true });
+const call = (m, extra = {}) => new Promise((res, rej) => { const i = ++id; pend.set(i, { res, rej }); w.postMessage({ ...m, ...extra, id: i }, extra.buf ? [extra.buf] : []); });
+async function frame(t) {
+  const img = new Image(); img.src = `${dir}/f${String(t).padStart(3, '0')}.png`; await img.decode();
+  c.width = img.width; c.height = img.height; ctx.drawImage(img, 0, 0);
+  return { buf: ctx.getImageData(0, 0, c.width, c.height).data.buffer, w: c.width, h: c.height };
+}
+const ap = (H, [x, y]) => { const k = H[6] * x + H[7] * y + H[8]; return [(H[0] * x + H[1] * y + H[2]) / k, (H[3] * x + H[4] * y + H[5]) / k]; };
+try {
+  await call({ type: 'init', urls: [CV] });
+  const out = [];
+  let quad0 = null, mode = 'sel';
+  await call({ type: 'selStart' }, await frame(1));
+  let ti = 0;
+  for (let t = 1; t <= N; t += step) {
+    const f = await frame(t);
+    const t0 = performance.now();
+    let row = { t };
+    if (ti < taps.length && taps[ti].f <= t) {
+      const r = await call({ type: 'selTap', point: taps[ti].p }, f);
+      ti++;
+      row.tap = { snapped: r.snapped, p: r.p };
+      if (r.type === 'locked') { mode = 'track'; quad0 = r.quad; row.locked = { quad: r.quad, points: r.points, edges: r.edges, weak: r.weak }; }
+      else row.pts = r.pts;
+    } else if (mode === 'sel') {
+      const r = await call({ type: 'frame' }, f);
+      row.pts = r.pts;
+    } else {
+      const r = await call({ type: 'frame' }, f);
+      row.state = r.state; row.ms = r.ms; row.src = r.source;
+      row.quad = r.H && quad0 ? quad0.map((q) => ap(r.H, q)) : null;
+    }
+    row.dt = Math.round(performance.now() - t0);
+    out.push(row);
+  }
+  window.result = { rows: out };
+} catch (e) { window.result = { error: String(e && e.message || e) }; }
+</script>

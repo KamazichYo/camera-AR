@@ -69,6 +69,7 @@ canvas.ref {
 #ui-layer .mark { stroke: #000; stroke-width: 1.5; }
 #ui-layer .mark.snap { fill: var(--accent); }
 #ui-layer .mark.free { fill: rgba(255, 255, 255, .9); }
+#ui-layer .mark.lost { fill: rgba(150, 150, 150, .6); stroke-dasharray: 3 3; }
 #ui-layer .mark.pend { fill: none; stroke: var(--accent); stroke-width: 3; animation: pulse .6s infinite; }
 #ui-layer .hlabel { fill: var(--accent-ink); font: 700 13px system-ui; text-anchor: middle; }
 #ui-layer .canvas-frame { fill: none; stroke: var(--ok); stroke-width: 1.5; stroke-dasharray: 3 4; opacity: .8; }
@@ -145,7 +146,7 @@ body.paused .rec-ind .dot { animation: none; }
   pointer-events: none; transition: opacity .2s;
 }
 .toolbar > * { pointer-events: auto; }
-.toolbar.dimmed { opacity: .25; pointer-events: none; }
+.toolbar.dimmed { opacity: 0; pointer-events: none; } /* на время выбора углов экран целиком отдан камере */
 .toolbar.dimmed > * { pointer-events: none; }
 .row { display: flex; align-items: center; gap: 10px; }
 .main-row { gap: clamp(8px, 3.5vw, 22px); }
@@ -167,18 +168,23 @@ input[type=range] { flex: 1; accent-color: var(--accent); min-width: 80px; heigh
 body.recording .rec-btn span { width: 28px; height: 28px; border-radius: 7px; }
 
 /* ---------- выбор холста ---------- */
+/* Панель выбора углов: компактная, вверху, и пропускает касания — под ней тоже можно отмечать углы */
 #ar-select-bar {
-  position: fixed; z-index: 12; left: 50%; transform: translateX(-50%);
-  bottom: calc(var(--safe-b) + 20px); width: min(460px, calc(100% - 24px));
-  background: var(--panel); backdrop-filter: blur(12px); -webkit-backdrop-filter: blur(12px);
-  border: 1px solid var(--line); border-radius: 18px; padding: 12px 14px; text-align: center;
+  position: fixed; z-index: 12; left: 0; right: 0; top: calc(var(--safe-t) + 58px);
+  display: flex; justify-content: center; padding: 0 12px; pointer-events: none;
 }
-#ar-select-bar p { margin: 0 0 8px; font-size: 17px; font-weight: 600; }
-#ar-dots { display: flex; justify-content: center; gap: 10px; margin-bottom: 12px; }
+#ar-select-bar .sel-pill {
+  display: flex; align-items: center; gap: 12px; flex-wrap: wrap; justify-content: center;
+  padding: 8px 12px; border-radius: 16px; max-width: 100%;
+  background: var(--panel); backdrop-filter: blur(12px); -webkit-backdrop-filter: blur(12px);
+  border: 1px solid var(--line);
+}
+#ar-select-bar button { pointer-events: auto; padding: 7px 12px; font-size: 14px; }
+#ar-hint { font-size: 15px; font-weight: 600; }
+#ar-dots { display: flex; gap: 8px; }
 #ar-dots i { width: 10px; height: 10px; border-radius: 50%; background: rgba(255, 255, 255, .25); transition: background .15s, transform .15s; }
 #ar-dots i.on { background: var(--accent); transform: scale(1.2); }
-#ar-select-bar .row { justify-content: center; }
-#ar-select-bar .row button { flex: 1; }
+body.selecting #toast { top: calc(var(--safe-t) + 122px); }
 
 /* ---------- панели ---------- */
 .sheet {

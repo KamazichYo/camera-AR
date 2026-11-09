@@ -18,7 +18,7 @@ if (fs.existsSync(vfile)) {
   for (const [n, c] of Object.entries(v).filter(([k, c]) => !k.startsWith('_') && c.paint)) {
     // У холста на фото два допустимых контура: граница живописи (paint) и холст с полями (gt).
     // Угол засчитывается, если он — настоящий угол любого из них. Допуск — в пикселях исходного фото.
-    cases.push({ w: c.w, h: c.h, name: `фото ${n}`, url: `/t/.data/real/${c.file}`, gt: c.paint, alt: c.gt, jitter: 32, tol: 60, qtol: 14, real: true });
+    cases.push({ w: c.w, h: c.h, name: `фото ${n}`, url: `/t/.data/real/${c.file}`, gt: c.paint, alt: c.gt, jitter: 32, tol: 60, qtol: 22, real: true });
   }
 }
 
@@ -34,23 +34,22 @@ if (fs.existsSync(vfile)) {
         const a = r() * 2 * Math.PI, d = c.jitter * (0.35 + 0.65 * r());
         return [c.gt[i][0] + Math.cos(a) * d, c.gt[i][1] + Math.sin(a) * d];
       }).map(([x, y]) => [Math.min(c.w - 2, Math.max(2, x)), Math.min(c.h - 2, Math.max(2, y))]); // касание — внутри кадра
-      await page.goto(`${url}/t/snap-harness.html?second=${process.env.SECOND ?? 1}&img=${c.url}&taps=${encodeURIComponent(JSON.stringify(taps))}`);
+      await page.goto(`${url}/t/snap-harness.html?img=${c.url}&taps=${encodeURIComponent(JSON.stringify(taps))}`);
       await page.waitForFunction(() => window.result, null, { timeout: 120000 });
       const res = await page.evaluate(() => window.result);
       const label = `${c.name} #${trial + 1}`;
       if (res.error) { check(false, `${label}: ${res.error}`); continue; }
-      // углы после финального прохода (с учётом остальных трёх касаний)
+      // положение каждого угла в момент касания (дальше он ведётся по кадрам)
       const dErr = (p, i) => Math.min(Math.hypot(p[0] - c.gt[i][0], p[1] - c.gt[i][1]), c.alt ? Math.hypot(p[0] - c.alt[i][0], p[1] - c.alt[i][1]) : Infinity);
-      const errs = res.corners.map((p, k) => dErr(p, order[k]));
+      const errs = res.snaps.map((s, k) => dErr(s.p, order[k]));
       const worst = Math.max(...errs);
-      const first = res.snaps.map((s, k) => dErr(s.p, order[k]));
       check(worst <= c.tol,
-        `${label}: углы притянуты (худшая ошибка ${worst.toFixed(1)} px при смещении касаний ≤ ${c.jitter} px; после первого касания ${Math.max(...first).toFixed(1)} px; ${Math.round(res.ms)} мс на касание)`);
-      if (worst > c.tol && process.env.VERBOSE) taps.forEach((t, k) => console.log('     касание', t.map(Math.round), '→ цель', c.gt[order[k]].map(Math.round), '→ первично', res.snaps[k].p.map(Math.round), res.snaps[k].score, '→ итог', res.corners[k].map(Math.round)));
+        `${label}: углы притянуты (худшая ошибка ${worst.toFixed(1)} px при смещении касаний ≤ ${c.jitter} px; ${Math.round(res.ms)} мс на касание)`);
+      if (worst > c.tol && process.env.VERBOSE) taps.forEach((t, k) => console.log('     касание', t.map(Math.round), '→ цель', c.gt[order[k]].map(Math.round), '→ притянут', res.snaps[k].p.map(Math.round)));
       if (!res.quad) { check(false, `${label}: четырёхугольник не построен`); continue; }
       // порядок вершин итога может начинаться с любого — берём лучший циклический сдвиг
       const qe = Math.min(...[0, 1, 2, 3].map((sft) => res.quad.reduce((acc, p, i) => acc + dErr(p, (i + sft) % 4), 0) / 4));
-      check(qe <= c.qtol, `${label}: итоговая рамка (ошибка ${qe.toFixed(1)} px${res.refined ? ', уточнена по краям' : ''})`);
+      check(qe <= c.qtol, `${label}: итоговая рамка, с которой стартует AR (ошибка ${qe.toFixed(1)} px)`);
     }
   }
   // касание там, где углов нет (середина холста) — не должно «примагничиваться» к чему попало
