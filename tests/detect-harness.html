@@ -1,0 +1,22 @@
+<!doctype html><body><script type="module">
+// Автопоиск холста на одном изображении. ?img=/t/.data/real/easel.png
+const P = new URLSearchParams(location.search);
+const CV = 'https://cdn.jsdelivr.net/npm/@techstark/opencv-js@4.10.0-release.1/dist/opencv.js';
+const img = new Image(); img.src = P.get('img'); await img.decode();
+const MAX = 640, s = Math.min(1, MAX / Math.max(img.width, img.height));
+const w = Math.round(img.width * s), h = Math.round(img.height * s);
+const c = document.createElement('canvas'); c.width = w; c.height = h;
+const ctx = c.getContext('2d', { willReadFrequently: true });
+ctx.drawImage(img, 0, 0, w, h);
+const worker = new Worker('/app/js/tracker.worker.js');
+let id = 0; const pend = new Map();
+worker.onmessage = (e) => { const p = pend.get(e.data.id); pend.delete(e.data.id); e.data.type === 'error' ? p.rej(new Error(e.data.message)) : p.res(e.data); };
+const call = (m, tr = []) => new Promise((res, rej) => { const i = ++id; pend.set(i, { res, rej }); worker.postMessage({ ...m, id: i }, tr); });
+try {
+  await call({ type: 'init', urls: [CV] });
+  const buf = ctx.getImageData(0, 0, w, h).data.buffer;
+  const t0 = performance.now();
+  const r = await call({ type: 'detect', buf, w, h }, [buf]);
+  window.result = { quad: r.quad && r.quad.map(([x, y]) => [x / s, y / s]), cands: r.cands && r.cands.map((c) => ({ ...c, q: c.q.map(([x, y]) => [x / s, y / s]) })),  ms: performance.now() - t0, size: [img.width, img.height] };
+} catch (e) { window.result = { error: String(e && e.message || e) }; }
+</script>
