@@ -806,9 +806,10 @@ function eccRefine(Hm, Tpl, coarse, affine) {
   const Hmat = cv.matFromArray(3, 3, cv.CV_64F, mulH(Hm, Tfi));  // заплатка → текущий кадр
   const U = new cv.Mat();
   cv.warpPerspective(gray, U, Hmat, new cv.Size(box.w, box.h), cv.INTER_LINEAR | cv.WARP_INVERSE_MAP, cv.BORDER_REPLICATE);
-  const V = eccValid(Hmat, box);
+  // на ладони (кожа — сама цель) маска не нужна и ECC ведёт себя как раньше
+  const V = st.skinOn ? eccValid(Hmat, box) : new cv.Mat();
   // закрыто рукой или вне кадра больше 60% заплатки — выравнивать нечем (ECC уехал бы вместе с рукой)
-  if (cv.countNonZero(V) < 0.4 * box.w * box.h) { Hmat.delete(); U.delete(); V.delete(); return null; }
+  if (st.skinOn && cv.countNonZero(V) < 0.4 * box.w * box.h) { Hmat.delete(); U.delete(); V.delete(); return null; }
   const C = affine ? cv.Mat.eye(2, 3, cv.CV_32F) : cv.Mat.eye(3, 3, cv.CV_32F);
   const motion = affine ? cv.MOTION_AFFINE : cv.MOTION_HOMOGRAPHY;
   if (coarse) {
@@ -818,7 +819,7 @@ function eccRefine(Hm, Tpl, coarse, affine) {
     cv.resize(Tpl || e.T, T2, sz, 0, 0, cv.INTER_AREA);
     cv.resize(U, U2, sz, 0, 0, cv.INTER_AREA);
     const V2 = new cv.Mat();
-    cv.resize(V, V2, sz, 0, 0, cv.INTER_NEAREST);
+    if (st.skinOn) cv.resize(V, V2, sz, 0, 0, cv.INTER_NEAREST);
     let cc2 = -1;
     try { cc2 = cv.findTransformECC(T2, U2, C2, motion, new cv.TermCriteria(3, 50, 1e-3), V2, 3); } catch (err) { cc2 = -1; }
     if (cc2 > 0.3) {
@@ -1318,7 +1319,8 @@ function track(msg) {
   let ecc = null;
   if (st.tmpl && st.tmpl.ecc && st.eccOk && (wasLost || st.lowTex || st.cur.length / 2 < CFG.eccSparse || st.frame % CFG.eccEvery === 0)) {
     // поток уверенно держит позу, а плотное выравнивание с ней резко спорит (закрашенный холст, рука на заплатке) — верим потоку
-    const lkPose = source === 'lk' && lkInl >= 25 ? pred.slice() : null;
+    // (на ладони, где цель сама кожа, ECC нужен для снятия дрейфа потока — там это правило не действует)
+    const lkPose = st.skinOn && source === 'lk' && lkInl >= 25 ? pred.slice() : null;
     const sane = (r) => r && plausible(r.H) && shapeOk(r.H) && quadDist(r.H, pred) < Math.max(W, H) * 0.15 &&
       (!lkPose || visDist(r.H, lkPose) < CFG.eccVsLk);
     const coarse = wasLost || st.fail > 0;
@@ -1458,7 +1460,7 @@ function track(msg) {
     if (!pairs.skipped) st.tmpl.low = st.tmpl.n >= 8 && pairs.ratio < 0.4 ? st.tmpl.low + 1 : 0;
     // холст закрашивают: эталон по кадру захвата больше не совпадает (якорная заплатка давно не сходится) — переучиваем
     // его по текущему виду, но не когда на холсте рука (в эталон попала бы кожа); у пустой бумаги — не переучиваем
-    const repaint = (st.ancLow || 0) > 5 && lkInl >= 25;
+    const repaint = st.skinOn && (st.ancLow || 0) > 5 && lkInl >= 25;
     if ((st.tmpl.low > 20 || repaint) && st.stable > 5 && !st.fail && !st.auto && skinOnCanvas() < 0.03) {
       updateTemplate(); st.ancLow = 0; st.tmpl.low = 0;
     }
