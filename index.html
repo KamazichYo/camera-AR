@@ -1,0 +1,246 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, user-scalable=no">
+  <meta name="theme-color" content="#0d0f12">
+  <meta name="description" content="Камера для художника: запись процесса рисования, полупрозрачный референс поверх холста и AR-привязка к холсту.">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <link rel="manifest" href="manifest.webmanifest">
+  <link rel="icon" href="icons/icon.svg" type="image/svg+xml">
+  <link rel="apple-touch-icon" href="icons/icon-180.png">
+  <title>ArtCam — камера художника</title>
+  <link rel="stylesheet" href="css/style.css">
+</head>
+<body>
+  <svg width="0" height="0" style="position:absolute" aria-hidden="true">
+    <defs>
+      <symbol id="i-image" viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="16" rx="2.5"/><circle cx="9" cy="10" r="1.8"/><path d="M4 18l5.5-5.5 4 4L16 14l4 4"/></symbol>
+      <symbol id="i-sliders" viewBox="0 0 24 24"><path d="M4 7h10M18 7h2M4 17h4M12 17h8"/><circle cx="16" cy="7" r="2"/><circle cx="10" cy="17" r="2"/></symbol>
+      <symbol id="i-camera" viewBox="0 0 24 24"><path d="M4 8h3l2-2.5h6L17 8h3v11H4z"/><circle cx="12" cy="13" r="3.5"/></symbol>
+      <symbol id="i-eye" viewBox="0 0 24 24"><path d="M2.5 12S6 5.5 12 5.5 21.5 12 21.5 12 18 18.5 12 18.5 2.5 12 2.5 12z"/><circle cx="12" cy="12" r="3"/></symbol>
+      <symbol id="i-lock" viewBox="0 0 24 24"><rect x="5" y="11" width="14" height="9" rx="2"/><path d="M8 11V8a4 4 0 0 1 8 0v3"/></symbol>
+      <symbol id="i-gear" viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M12 2.5v3M12 18.5v3M2.5 12h3M18.5 12h3M5.3 5.3l2.1 2.1M16.6 16.6l2.1 2.1M5.3 18.7l2.1-2.1M16.6 7.4l2.1-2.1"/></symbol>
+      <symbol id="i-full" viewBox="0 0 24 24"><path d="M4 9V4h5M15 4h5v5M20 15v5h-5M9 20H4v-5"/></symbol>
+      <symbol id="i-help" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M9.5 9.5a2.5 2.5 0 1 1 3.5 2.3c-.7.3-1 .9-1 1.7M12 16.8v.2"/></symbol>
+      <symbol id="i-pause" viewBox="0 0 24 24"><path d="M9 6v12M15 6v12"/></symbol>
+      <symbol id="i-switch" viewBox="0 0 24 24"><path d="M4 8h3l2-2.5h6L17 8h3v11H4z"/><path d="M9 13a3 3 0 0 1 5.2-2M15 13a3 3 0 0 1-5.2 2M14.5 9.5v1.6h-1.6M9.5 16.5v-1.6h1.6"/></symbol>
+    </defs>
+  </svg>
+
+  <main id="stage">
+    <div id="world"><video id="video" playsinline muted autoplay></video></div>
+    <svg id="ui-layer"></svg>
+    <div id="flash"></div>
+  </main>
+
+  <section id="start-screen">
+    <div class="start-card">
+      <img src="icons/icon.svg" alt="" class="logo">
+      <h1>ArtCam</h1>
+      <p>Камера для художника: записывайте процесс, накладывайте полупрозрачный референс поверх холста и привязывайте его к холсту с помощью AR.</p>
+      <button id="btn-start" class="primary big">Включить камеру</button>
+      <p id="start-error" class="error" role="alert"></p>
+      <p class="hint">Референс виден только на экране — в видео и фото попадает чистый кадр.</p>
+    </div>
+  </section>
+
+  <header class="topbar ui-block">
+    <div id="rec-indicator" class="rec-ind" hidden><span class="dot"></span><span id="rec-time">00:00</span></div>
+    <button id="btn-pause" class="icon small" hidden title="Пауза"><svg><use href="#i-pause"/></svg></button>
+    <div id="ar-pill" class="pill" hidden></div>
+    <span class="spacer"></span>
+    <button id="btn-help" class="icon small" title="Справка"><svg><use href="#i-help"/></svg></button>
+    <button id="btn-fullscreen" class="icon small" title="Во весь экран"><svg><use href="#i-full"/></svg></button>
+    <button id="btn-settings" class="icon small" title="Настройки"><svg><use href="#i-gear"/></svg></button>
+  </header>
+  <div id="stats"></div>
+
+  <div id="ar-select-bar" class="ui-block" hidden>
+    <p>Перетащите 4 угла рамки на углы холста</p>
+    <div class="row">
+      <button id="ar-auto">Найти</button>
+      <button id="ar-cancel">Отмена</button>
+      <button id="ar-start" class="primary">Отслеживать</button>
+    </div>
+  </div>
+
+  <footer class="toolbar ui-block">
+    <div class="row ref-row">
+      <button id="btn-eye" class="icon" title="Показать/скрыть референс (H)"><svg><use href="#i-eye"/></svg></button>
+      <label class="opacity">
+        <input id="opacity" type="range" min="0" max="100" step="1" aria-label="Прозрачность референса">
+        <span id="opacity-val">50%</span>
+      </label>
+      <button id="btn-pin" class="icon" title="Закрепить положение (L)"><svg><use href="#i-lock"/></svg></button>
+    </div>
+    <div class="row main-row">
+      <button id="btn-image" class="icon" title="Загрузить референс (O)"><svg><use href="#i-image"/></svg><span>Фото</span></button>
+      <button id="btn-ref-panel" class="icon" title="Настройки референса"><svg><use href="#i-sliders"/></svg><span>Вид</span></button>
+      <button id="btn-record" class="rec-btn" title="Запись (пробел)" aria-label="Запись"><span></span></button>
+      <button id="btn-photo" class="icon" title="Снимок (P)"><svg><use href="#i-camera"/></svg><span>Снимок</span></button>
+      <button id="btn-ar" class="icon ar" title="AR-привязка к холсту (A)"><b>AR</b><span>Холст</span></button>
+    </div>
+  </footer>
+
+  <input id="file" type="file" accept="image/*" hidden>
+
+  <section id="panel-ref" class="sheet ui-block" hidden>
+    <div class="sheet-head"><h2>Референс</h2><button class="close" aria-label="Закрыть">✕</button></div>
+    <div class="no-ref-only">
+      <p class="muted">Референс не загружен.</p>
+      <button id="btn-load-image" class="primary">Выбрать изображение</button>
+      <p class="muted small">Также можно перетащить файл в окно или вставить из буфера (Ctrl+V).</p>
+    </div>
+    <div class="ref-only">
+      <div class="field">
+        <span class="label">Режим</span>
+        <div id="mode-seg" class="seg">
+          <button data-mode="color">Цвет</button>
+          <button data-mode="gray">Ч/Б</button>
+          <button data-mode="outline">Контур</button>
+          <button data-mode="invert">Негатив</button>
+          <button data-mode="none">Сетка</button>
+        </div>
+      </div>
+      <div class="field inline">
+        <label for="grid">Сетка поверх</label>
+        <input id="grid" type="checkbox" class="switch">
+      </div>
+      <div class="field inline">
+        <label for="grid-n">Клеток по ширине: <b id="grid-n-val">6</b></label>
+        <input id="grid-n" type="range" min="2" max="24" step="1">
+      </div>
+      <div class="field inline">
+        <label for="line-color">Цвет линий (контур, сетка)</label>
+        <input id="line-color" type="color">
+      </div>
+      <div class="btn-grid">
+        <button id="btn-flip-h">⇋ Отразить</button>
+        <button id="btn-flip-v">⇵ Отразить</button>
+        <button id="btn-rotate">↻ 90°</button>
+        <button id="btn-straighten">Без перспективы</button>
+        <button id="btn-fit-screen">Вписать в экран</button>
+        <span id="fit-canvas-wrap"><button id="btn-fit-canvas" title="Доступно при включённом AR">Вписать в холст</button></span>
+      </div>
+      <p class="muted small">Двигайте референс пальцем, двумя пальцами — масштаб и поворот, углы — перспектива. На компьютере: колесо — масштаб, Shift+колесо — поворот.</p>
+      <button id="btn-remove-ref" class="danger wide">Убрать референс</button>
+    </div>
+  </section>
+
+  <section id="panel-settings" class="sheet ui-block" hidden>
+    <div class="sheet-head"><h2>Настройки</h2><button class="close" aria-label="Закрыть">✕</button></div>
+    <h3>Камера <small id="cam-info" class="muted"></small></h3>
+    <div class="field inline">
+      <select id="camera-select" aria-label="Камера"></select>
+      <button id="btn-flip-cam" class="icon small" title="Следующая камера"><svg><use href="#i-switch"/></svg></button>
+    </div>
+    <div class="field inline">
+      <label for="resolution">Разрешение</label>
+      <select id="resolution">
+        <option value="720">720p</option>
+        <option value="1080">1080p</option>
+        <option value="1440">1440p</option>
+        <option value="2160">4K</option>
+      </select>
+    </div>
+    <div class="field inline" id="zoom-row" hidden>
+      <label for="zoom">Зум</label>
+      <input id="zoom" type="range">
+    </div>
+    <div class="field inline" id="torch-row" hidden>
+      <label for="torch">Фонарик</label>
+      <input id="torch" type="checkbox" class="switch">
+    </div>
+    <div class="field inline">
+      <label for="fit">Изображение</label>
+      <select id="fit">
+        <option value="contain">Целиком</option>
+        <option value="cover">На весь экран</option>
+      </select>
+    </div>
+
+    <h3>Запись</h3>
+    <div class="field inline">
+      <label for="mic">Записывать звук (микрофон)</label>
+      <input id="mic" type="checkbox" class="switch">
+    </div>
+    <div class="field inline">
+      <label for="bitrate">Качество</label>
+      <select id="bitrate">
+        <option value="2500000">Экономно (2,5 Мбит/с)</option>
+        <option value="6000000">Стандарт (6 Мбит/с)</option>
+        <option value="12000000">Высокое (12 Мбит/с)</option>
+        <option value="25000000">Максимум (25 Мбит/с)</option>
+      </select>
+    </div>
+
+    <h3>AR-отслеживание</h3>
+    <div class="field inline">
+      <label for="show-canvas">Показывать рамку холста</label>
+      <input id="show-canvas" type="checkbox" class="switch">
+    </div>
+    <div class="field inline">
+      <label for="surroundings">Учитывать окружение<br><small class="muted">если холст пустой и лежит на столе с текстурой</small></label>
+      <input id="surroundings" type="checkbox" class="switch">
+    </div>
+    <div class="field inline">
+      <label for="smoothing">Плавность</label>
+      <input id="smoothing" type="range" min="0" max="100" step="1">
+    </div>
+    <div class="field inline">
+      <label for="stats-toggle">Показывать статистику</label>
+      <input id="stats-toggle" type="checkbox" class="switch">
+    </div>
+
+    <h3>Прочее</h3>
+    <div class="field inline">
+      <label for="wake">Не гасить экран</label>
+      <input id="wake" type="checkbox" class="switch">
+    </div>
+  </section>
+
+  <div id="modal-media" class="modal" hidden>
+    <div class="modal-card">
+      <h2 id="media-title">Запись</h2>
+      <div id="media-preview"></div>
+      <p id="media-info" class="muted small"></p>
+      <div class="modal-actions">
+        <button id="media-delete" class="danger">Удалить</button>
+        <button id="media-close">Закрыть</button>
+        <button id="media-share">Поделиться</button>
+        <button id="media-save" class="primary">Сохранить</button>
+      </div>
+    </div>
+  </div>
+
+  <div id="modal-help" class="modal" hidden>
+    <div class="modal-card help">
+      <h2>Как пользоваться</h2>
+      <ol>
+        <li><b>Фото</b> — загрузите референс. Он появится поверх изображения с камеры.</li>
+        <li>Ползунком внизу меняйте прозрачность, <b>глаз</b> — быстро скрыть/показать.</li>
+        <li>Двигайте референс пальцем, щипком масштабируйте и вращайте, тяните за углы, чтобы совместить перспективу с холстом. <b>Замок</b> закрепляет положение.</li>
+        <li><b>Вид</b> — режимы: Ч/Б, контур для перевода рисунка, негатив, сетка для переноса по клеткам.</li>
+        <li><b>AR</b> — привязка к холсту: совместите рамку с углами холста и нажмите «Отслеживать». Теперь референс «приклеен» к холсту, даже если двигать телефон или холст.</li>
+        <li>Красная кнопка — запись видео. <b>В запись референс не попадает</b> — только чистый кадр.</li>
+      </ol>
+      <h3>Советы для AR</h3>
+      <ul>
+        <li>Трекинг держится за детали: углы холста, штрихи, текстуру. На пустом белом листе наклейте кусочки малярного скотча или поставьте крестики по углам.</li>
+        <li>Если лист лежит на столе с узором — включите «Учитывать окружение».</li>
+        <li>Хорошее ровное освещение и неподвижный телефон (штатив) дают самый стабильный результат.</li>
+        <li>Рука над холстом не мешает — она отбрасывается как выброс.</li>
+      </ul>
+      <p class="muted small">Горячие клавиши: пробел/R — запись, H — скрыть, L — замок, A — AR, P — снимок, O — открыть, ↑↓ — прозрачность.</p>
+      <div class="modal-actions"><button id="help-close" class="primary">Понятно</button></div>
+    </div>
+  </div>
+
+  <div id="toast" role="status" aria-live="polite"></div>
+
+  <script type="module" src="js/app.js"></script>
+</body>
+</html>
