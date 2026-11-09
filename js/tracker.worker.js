@@ -228,13 +228,14 @@ function convex(q) {
 }
 
 /** Упорядочить 4 точки по часовой стрелке (на экране), начиная с верхней левой. */
-function orderQuad(pts) {
+function orderIdx(pts) {
   const [cx, cy] = centroid(pts);
-  const s = [...pts].sort((a, b) => Math.atan2(a[1] - cy, a[0] - cx) - Math.atan2(b[1] - cy, b[0] - cx));
+  const idx = pts.map((_, i) => i).sort((a, b) => Math.atan2(pts[a][1] - cy, pts[a][0] - cx) - Math.atan2(pts[b][1] - cy, pts[b][0] - cx));
   let k = 0;
-  s.forEach((p, i) => { if (p[0] + p[1] < s[k][0] + s[k][1]) k = i; });
-  return [...s.slice(k), ...s.slice(0, k)];
+  idx.forEach((id, i) => { if (pts[id][0] + pts[id][1] < pts[idx[k]][0] + pts[idx[k]][1]) k = i; });
+  return [...idx.slice(k), ...idx.slice(0, k)];
 }
+function orderQuad(pts) { return orderIdx(pts).map((i) => pts[i]); }
 
 /** Правдоподобие позы: холст выпуклый, без отражения, разумного размера и не улетел. */
 function plausible(Hm) {
@@ -968,7 +969,7 @@ const DET = {
 };
 
 /** Карты градиента кадра: величина и направление по цветовому каналу с самым сильным перепадом. */
-function gradientMaps() {
+function gradientMaps(needEdges = true) {
   const rgb = new cv.Mat(), blur = new cv.Mat();
   cv.cvtColor(rgba, rgb, cv.COLOR_RGBA2RGB);
   cv.GaussianBlur(rgb, blur, new cv.Size(5, 5), 1.2);
@@ -990,12 +991,15 @@ function gradientMaps() {
   const mag = new Float32Array(n);
   for (let i = 0; i < n; i++) mag[i] = Math.sqrt(mag2[i]);
   // карта краёв для Хафа — Кэнни по каждому каналу, объединение
-  const edges = new cv.Mat.zeros(H, W, cv.CV_8UC1);
-  for (let c = 0; c < 3; c++) {
-    const plane = ch.get(c), e = new cv.Mat();
-    cv.Canny(plane, e, 14, 42);
-    cv.bitwise_or(edges, e, edges);
-    plane.delete(); e.delete();
+  let edges = null;
+  if (needEdges) {
+    edges = new cv.Mat.zeros(H, W, cv.CV_8UC1);
+    for (let c = 0; c < 3; c++) {
+      const plane = ch.get(c), e = new cv.Mat();
+      cv.Canny(plane, e, 14, 42);
+      cv.bitwise_or(edges, e, edges);
+      plane.delete(); e.delete();
+    }
   }
   [rgb, blur].forEach((m) => m.delete());
   ch.delete();
@@ -1207,7 +1211,24 @@ function findCanvasCandidates() {
 }
 
 /** Уточнение углов: прямые заново подгоняются по точкам края вдоль каждой стороны. */
-function refineQuad(maps, q) {
+function refineQuad(maps, q, opt = {}) {
+  let cur = q, ok = false;
+  for (let it = 0; it < (opt.iters || 1); it++) {
+    const keep = DET.searchPx;
+    DET.searchPx = it === 0 && opt.iters ? 4 : keep;
+    const nq = refineOnce(maps, cur, !opt.anchors);
+    DET.searchPx = keep;
+    if (!nq) break;
+    // не уходим от того, что показал пользователь: угол остаётся рядом с касанием
+    if (opt.anchors && nq.some((p, i) => Math.hypot(p[0] - opt.anchors[i][0], p[1] - opt.anchors[i][1]) > opt.rad)) break;
+    const moved = Math.max(...nq.map((p, i) => Math.hypot(p[0] - cur[i][0], p[1] - cur[i][1])));
+    cur = nq; ok = true;
+    if (moved < 0.3) break;
+  }
+  return ok ? cur : null;
+}
+
+function refineOnce(maps, q, limitMove) {
   const ls = [];
   for (let j = 0; j < 4; j++) {
     const A = q[j], B = q[(j + 1) % 4];
@@ -1217,15 +1238,167 @@ function refineQuad(maps, q) {
       l = { x: A[0], y: A[1], ux: (B[0] - A[0]) / d, uy: (B[1] - A[1]) / d }; // граница кадра остаётся как есть
     } else {
       l = fitPts(sideSupport(maps, A, B, true).pts);
+      if (!l) { // край не виден — оставляем сторону как есть (прямая через заданные углы)
+        const d = Math.hypot(B[0] - A[0], B[1] - A[1]) || 1;
+        l = { x: A[0], y: A[1], ux: (B[0] - A[0]) / d, uy: (B[1] - A[1]) / d };
+      }
     }
-    if (!l) return null;
     ls.push(l);
   }
   const nq = [0, 1, 2, 3].map((j) => lineIntersect(ls[(j + 3) % 4], ls[j]));
   if (nq.some((p) => !p)) return null;
   const diag = Math.hypot(W, H);
-  if (nq.some((p, i) => Math.hypot(p[0] - q[i][0], p[1] - q[i][1]) > 0.04 * diag)) return null;
+  if (limitMove && nq.some((p, i) => Math.hypot(p[0] - q[i][0], p[1] - q[i][1]) > 0.04 * diag)) return null;
   return quadOk(nq) ? nq : null;
+}
+
+// ---------- выбор холста касаниями ----------
+// Пользователь касается углов холста (в любом порядке). Каждое касание притягивается к ближайшему
+// настоящему углу: точке, из которой выходят два длинных прямых края под разумным углом.
+// Затем 4 точки упорядочиваются и уточняются по краям между ними.
+const SNAP = {
+  radius: 0.05,         // радиус поиска угла вокруг касания, доля большей стороны кадра (≈ 37 css-px на телефоне)
+  rayLen: 0.11,         // длина лучей-краёв
+  rays: 24,             // направлений (шаг 15°)
+  minSupport: 0.5,      // доля луча, на которой есть край нужного направления
+  minScore: 0.4,
+  minAngle: 40, maxAngle: 140, // допустимый угол между краями, градусы (перспектива)
+};
+
+/** Карта «пиксель края»: номер ориентации (1..12) или 0. Пик градиента заметно выше соседей вдоль градиента. */
+function edgeOrientMap(maps, x0, y0, x1, y1) {
+  const edge = new Uint8Array(W * H);
+  const { mag, gx, gy } = maps;
+  for (let y = Math.max(10, y0); y < Math.min(H - 10, y1); y++) {
+    for (let x = Math.max(10, x0); x < Math.min(W - 10, x1); x++) {
+      const i = y * W + x, m = mag[i];
+      if (m < DET.gradMin) continue;
+      const nx = gx[i] / m, ny = gy[i] / m;
+      const at = (t) => mag[Math.round(y + ny * t) * W + Math.round(x + nx * t)];
+      if (m < at(-1) || m < at(1)) continue; // локальный максимум поперёк края
+      const mean = (at(-9) + at(-8) + at(-7) + at(-6) + at(-5) + at(5) + at(6) + at(7) + at(8) + at(9)) / 10;
+      if (m < DET.peakRatio * mean) continue;
+      let ang = Math.atan2(ny, nx) + Math.PI / 2; // направление края
+      ang = ((ang % Math.PI) + Math.PI) % Math.PI;
+      edge[i] = 1 + (Math.floor(ang / (Math.PI / 12)) % 12);
+    }
+  }
+  return edge;
+}
+
+/**
+ * Опора луча из q в направлении θ (рад): доля точек луча, рядом (±2 px поперёк) с которыми есть край
+ * той же ориентации (±15°). pts, если передан, пополняется найденными краевыми точками.
+ */
+function raySupport(edge, qx, qy, th, L, pts) {
+  const dx = Math.cos(th), dy = Math.sin(th), nx = -dy, ny = dx;
+  const want = Math.round((((th % Math.PI) + Math.PI) % Math.PI) / (Math.PI / 12)) % 12; // ожидаемая ориентация 0..11
+  let hit = 0, n = 0;
+  for (let t = 6; t <= L; t += 2) {
+    n++;
+    for (const o of [0, -1, 1, -2, 2]) {
+      const x = Math.round(qx + dx * t + nx * o), y = Math.round(qy + dy * t + ny * o);
+      if (x < 0 || y < 0 || x >= W || y >= H) continue;
+      const e = edge[y * W + x];
+      if (!e) continue;
+      let d = Math.abs(e - 1 - want);
+      d = Math.min(d, 12 - d);
+      if (d > 1) continue;
+      hit++;
+      if (pts) pts.push([x, y]);
+      break;
+    }
+  }
+  return n ? hit / n : 0;
+}
+
+function snapCorner(maps, tap, others) {
+  const M = Math.max(W, H), R = SNAP.radius * M, L = SNAP.rayLen * M;
+  const pad = R + L + 8;
+  const edge = edgeOrientMap(maps, Math.floor(tap[0] - pad), Math.floor(tap[1] - pad), Math.ceil(tap[0] + pad), Math.ceil(tap[1] + pad));
+  const K = SNAP.rays, step = 2 * Math.PI / K;
+  const toDeg = 180 / Math.PI;
+  let best = null;
+  for (let qy = Math.floor(tap[1] - R); qy <= tap[1] + R; qy += 2) {
+    for (let qx = Math.floor(tap[0] - R); qx <= tap[0] + R; qx += 2) {
+      const d = Math.hypot(qx - tap[0], qy - tap[1]);
+      if (d > R || qx < 3 || qy < 3 || qx > W - 4 || qy > H - 4) continue;
+      // угол лежит на краю: рядом (±2 px) должен быть краевой пиксель
+      let onEdge = false;
+      for (let oy = -2; oy <= 2 && !onEdge; oy++) for (let ox = -2; ox <= 2; ox++) if (edge[(qy + oy) * W + qx + ox]) { onEdge = true; break; }
+      if (!onEdge) continue;
+      const sup = new Float32Array(K);
+      for (let k = 0; k < K; k++) {
+        sup[k] = raySupport(edge, qx, qy, k * step, L, null);
+        // луч в сторону другого касания — вероятное ребро холста
+        for (const o of others) {
+          let da = Math.abs(Math.atan2(o[1] - qy, o[0] - qx) - k * step); da = Math.min(da, 2 * Math.PI - da);
+          if (sup[k] >= 0.5 && da < 10 / toDeg) { sup[k] = Math.min(1, sup[k] + 0.06); break; }
+        }
+      }
+      for (let i = 0; i < K; i++) {
+        if (sup[i] < SNAP.minSupport) continue;
+        for (let j = i + 1; j < K; j++) {
+          if (sup[j] < SNAP.minSupport) continue;
+          let sep = (j - i) * step * toDeg; if (sep > 180) sep = 360 - sep;
+          if (sep < SNAP.minAngle || sep > SNAP.maxAngle) continue;
+          // ребро заканчивается в углу; продолжение «сквозь» точку (Т-образно) — слабый штраф
+          const opp = (sup[(i + K / 2) % K] + sup[(j + K / 2) % K]) / 2;
+          // настоящий угол: ОБА края опираются на весь луч; точка рядом с углом на одной стороне имеет
+          // у второго луча лишь частичную опору — произведение это строго наказывает
+          const base = Math.pow(sup[i] * sup[j], 0.75) * (1 - 0.3 * Math.max(0, opp - 0.25));
+          const score = base * (1 - 0.2 * (d / R) * (d / R));
+          if (!best || score > best.score) best = { score, x: qx, y: qy, i, j };
+        }
+      }
+    }
+  }
+  if (!best || best.score < SNAP.minScore) return { snapped: false, p: tap, score: best ? best.score : 0 };
+  // уточнение: прямые по краевым точкам вдоль двух лучей, угол — их пересечение
+  let p = [best.x, best.y];
+  const lines = [];
+  for (const k of [best.i, best.j]) {
+    const pts = [];
+    raySupport(edge, best.x, best.y, k * step, L, pts);
+    lines.push(fitPts(pts));
+  }
+  if (lines[0] && lines[1]) {
+    const c = lineIntersect(lines[0], lines[1]);
+    if (c && Math.hypot(c[0] - best.x, c[1] - best.y) < 6) p = c;
+  }
+  return { snapped: true, p, score: best.score };
+}
+
+/** Четыре точки в любом порядке → упорядоченный четырёхугольник, уточнённый по краям между ними. */
+function buildQuad(maps, pts, taps) {
+  const idx = orderIdx(pts), o = idx.map((i) => pts[i]);
+  if (!convex(o) || Math.abs(quadArea(o)) < 0.002 * W * H) return { quad: null };
+  const r = refineQuad(maps, o, { iters: 3, anchors: idx.map((i) => taps[i]), rad: 1.6 * SNAP.radius * Math.max(W, H) });
+  return { quad: r || o, refined: !!r };
+}
+
+function snap(msg) {
+  loadFrame(msg);
+  const maps = gradientMaps(false);
+  const res = snapCorner(maps, inQuad([msg.point])[0], inQuad(msg.others || []));
+  return { type: 'snapped', snapped: res.snapped, score: +res.score.toFixed(2), p: outQuad([res.p])[0] };
+}
+
+/**
+ * Финальный проход после 4-го касания. Сначала каждый угол пересчитывается заново, теперь уже
+ * зная остальные три (рёбра холста идут к соседним углам) — это спасает первые касания и слабые
+ * углы; затем точки упорядочиваются и рамка уточняется по краям между ними.
+ */
+function buildFromTaps(msg) {
+  loadFrame(msg);
+  const maps = gradientMaps(false);
+  const taps = inQuad(msg.taps), first = inQuad(msg.snapped);
+  const pts = msg.second === false ? first : taps.map((t, i) => {
+    const r = snapCorner(maps, t, first.filter((_, j) => j !== i));
+    return r.snapped ? r.p : first[i];
+  });
+  const r = buildQuad(maps, pts, taps);
+  return { type: 'quad', quad: r.quad && outQuad(r.quad), refined: !!r.refined, corners: outQuad(pts) };
 }
 
 function detect(msg) {
@@ -1256,6 +1429,8 @@ self.onmessage = async (e) => {
     if (msg.type === 'lock') res = lock(msg);
     else if (msg.type === 'frame') res = track(msg);
     else if (msg.type === 'detect') res = detect(msg);
+    else if (msg.type === 'snap') res = snap(msg);
+    else if (msg.type === 'quad') res = buildFromTaps(msg);
     else if (msg.type === 'setQuad') {
       // пользователь поправил рамку холста во время трекинга (в опорных координатах)
       if (st) { st.quad = inQuad(msg.quad); st.searchQuad = expandQuad(st.quad, msg.margin ?? CFG.margin); }

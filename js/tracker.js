@@ -116,11 +116,21 @@ export class ArTracker {
     return multiply([1 / sx, 0, 0, 0, 1 / sy, 0, 0, 0, 1], multiply(Hp, [sx, 0, 0, 0, sy, 0, 0, 0, 1]));
   }
 
-  /** Варианты холста в кадре (лучший первым), углы в координатах видео. */
-  async detectCanvas() {
+  /** Притянуть касание к ближайшему настоящему углу (там, где сходятся два длинных края). */
+  async snapCorner(pt, others = []) {
     await this.init();
-    const r = await this._send('detect');
-    return (r.cands || []).map((c) => ({ ...c, q: this._fromProc(c.q) }));
+    const r = await this._send('snap', { point: this._toProc([pt])[0], others: this._toProc(others) });
+    return { snapped: r.snapped, score: r.score, p: this._fromProc([r.p])[0] };
+  }
+
+  /**
+   * 4 касания (в любом порядке) + их первичные притяжения → упорядоченный четырёхугольник,
+   * уточнённый по краям (quad === null — точки не образуют четырёхугольник).
+   */
+  async buildQuad(taps, snapped) {
+    await this.init();
+    const r = await this._send('quad', { taps: this._toProc(taps), snapped: this._toProc(snapped) });
+    return { quad: r.quad ? this._fromProc(r.quad) : null, refined: r.refined };
   }
 
   /** Начать отслеживание. quad — холст в координатах видео (текущий кадр становится опорным). */

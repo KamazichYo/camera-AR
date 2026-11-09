@@ -3,7 +3,7 @@
 // из штрих-кода, показанная рамка сравнивается с истинным положением листа в этом кадре.
 const fs = require('fs');
 const path = require('path');
-const { launch, check, DATA } = require('./common.cjs');
+const { launch, check, DATA, frameIndex, waitFrame } = require('./common.cjs');
 
 const gt = JSON.parse(fs.readFileSync(path.join(DATA, 'main', 'gt.json'), 'utf8'));
 
@@ -50,20 +50,12 @@ function stats(rows, a, z) {
   await p.waitForFunction(() => document.querySelector('#video').videoWidth > 0);
   await p.setInputFiles('#file', path.join(DATA, 'ref.png'));
   await p.waitForFunction(() => window.artcam.ref.loaded);
+  await waitFrame(p, 1, 8); // кадр замрёт в неподвижной фазе сцены
   await p.evaluate(() => window.artcam.arBegin());
   await p.waitForFunction(() => window.artcam.ar.mode === 'select', null, { timeout: 60000 });
-  // захват в неподвижной фазе сцены (кадры 5–30): рамка = истинное положение листа
-  await p.waitForFunction((g) => {
-    const v = document.querySelector('#video');
-    const c = document.createElement('canvas'); c.width = 80; c.height = 10;
-    const ctx = c.getContext('2d'); ctx.drawImage(v, 0, 350, 80, 10, 0, 0, 80, 10);
-    const d = ctx.getImageData(0, 0, 80, 10).data;
-    let idx = 0;
-    for (let i = 0; i < 10; i++) if (d[(5 * 80 + 8 * i + 4) * 4] > 128) idx |= 1 << i;
-    if (idx < 5 || idx > 25) return false;
-    window.artcam.ar.selectQuad = g[idx].q;
-    return true;
-  }, gt, { timeout: 30000, polling: 20 });
+  // кадр замер на время выбора углов; рамка = истинное положение листа на этом кадре
+  const idx0 = await frameIndex(p);
+  await p.evaluate((q) => { window.artcam.ar.selectQuad = q; }, gt[idx0].q);
   await p.evaluate(() => window.artcam.arStart());
   await p.waitForFunction(() => window.artcam.ar.mode === 'tracking');
   // референс ровно по холсту — его рамка на экране и есть измеряемая величина

@@ -65,6 +65,11 @@ canvas.ref {
 #ui-layer .sel { fill: none; stroke: var(--accent); stroke-width: 2.5; }
 #ui-layer .sel-shade { fill: rgba(255, 176, 32, .12); }
 #ui-layer .sel-h { fill: var(--accent); stroke: #000; }
+#ui-layer .sel-prev { fill: none; stroke: var(--accent); stroke-width: 1.5; stroke-dasharray: 5 5; opacity: .85; }
+#ui-layer .mark { stroke: #000; stroke-width: 1.5; }
+#ui-layer .mark.snap { fill: var(--accent); }
+#ui-layer .mark.free { fill: rgba(255, 255, 255, .9); }
+#ui-layer .mark.pend { fill: none; stroke: var(--accent); stroke-width: 3; animation: pulse .6s infinite; }
 #ui-layer .hlabel { fill: var(--accent-ink); font: 700 13px system-ui; text-anchor: middle; }
 #ui-layer .canvas-frame { fill: none; stroke: var(--ok); stroke-width: 1.5; stroke-dasharray: 3 4; opacity: .8; }
 #ui-layer .canvas-frame.lost { stroke: var(--warn); }
@@ -168,7 +173,10 @@ body.recording .rec-btn span { width: 28px; height: 28px; border-radius: 7px; }
   background: var(--panel); backdrop-filter: blur(12px); -webkit-backdrop-filter: blur(12px);
   border: 1px solid var(--line); border-radius: 18px; padding: 12px 14px; text-align: center;
 }
-#ar-select-bar p { margin: 0 0 10px; color: var(--muted); }
+#ar-select-bar p { margin: 0 0 8px; font-size: 17px; font-weight: 600; }
+#ar-dots { display: flex; justify-content: center; gap: 10px; margin-bottom: 12px; }
+#ar-dots i { width: 10px; height: 10px; border-radius: 50%; background: rgba(255, 255, 255, .25); transition: background .15s, transform .15s; }
+#ar-dots i.on { background: var(--accent); transform: scale(1.2); }
 #ar-select-bar .row { justify-content: center; }
 #ar-select-bar .row button { flex: 1; }
 

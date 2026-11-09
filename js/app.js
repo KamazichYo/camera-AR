@@ -40,7 +40,8 @@ const ar = {
   mode: 'off',                     // off | loading | select | tracking
   state: 'tracking',               // tracking | lost
   H: IDENTITY,                     // опорный кадр → текущий (координаты видео)
-  selectQuad: null,                // рамка холста при выборе
+  selectQuad: null,                // рамка холста, построенная по 4 касаниям
+  corners: [],                     // отмеченные углы: { tap, p, snapped, pending }
   refCanvas: null,                 // холст в опорном кадре
   refOverlay: null,                // референс в опорном кадре
   lostSince: 0,
@@ -209,7 +210,7 @@ const selectEditor = new QuadEditor(stage, {
 });
 
 function updateEditors() {
-  selectEditor.enabled = ar.mode === 'select';
+  selectEditor.enabled = ar.mode === 'select' && !!ar.selectQuad;
   overlayEditor.enabled = ar.mode !== 'select' && ref.loaded && !S.pinned && S.visible;
 }
 
@@ -222,13 +223,11 @@ async function arBegin() {
     if (!tracker.loaded) toast('Загружаю AR-модуль (≈10 МБ, только в первый раз)…', { ms: 15000 });
     await tracker.init();
     if (ar.mode !== 'loading') return;
-    const r = stage.visibleRect();
-    ar.selectQuad = fitRect(4, 3, r.cx, r.cy, r.w * 0.7, r.h * 0.7);
-    detectCands = []; detectIdx = -1;
+    ar.selectQuad = null; ar.corners = [];
+    $('#toast').classList.remove('show'); // «Загружаю AR-модуль…» больше не нужна
     ar.mode = 'select';
+    freezeVideo(true); // кадр замирает: углы отмечаются на неподвижной картинке
     updateArUi();
-    toast('Совместите углы рамки с углами холста', { ms: 2500 });
-    autoDetect(true);
   } catch (e) {
     console.error(e);
     ar.mode = 'off';
@@ -245,37 +244,94 @@ function clampToView(q) {
   return q.map(([x, y]) => [Math.min(x1, Math.max(x0, x)), Math.min(y1, Math.max(y0, y))]);
 }
 
-let detectCands = [], detectIdx = -1;
-
-async function autoDetect(silent = false) {
+/** Пока выбираются углы, картинка стоит (запись при этом продолжается — пишется трек камеры). */
+function freezeVideo(on) {
   try {
-    // повторное нажатие «Найти» перебирает найденные варианты
-    if (!silent && detectCands.length > 1) {
-      detectIdx = (detectIdx + 1) % detectCands.length;
-    } else {
-      detectCands = (await tracker.detectCanvas()).filter((c) => isConvexQuad(c.q, 1000));
-      detectIdx = 0;
-    }
-    if (ar.mode !== 'select') return;
-    if (!detectCands.length) {
-      if (!silent) toast('Не удалось найти холст автоматически — поставьте углы вручную. Поможет контрастный фон за холстом.');
+    if (on) video.pause();
+    else video.play().catch(() => {});
+  } catch { /* не критично */ }
+}
+
+// ---------- выбор холста касаниями ----------
+// Пользователь касается 4 углов холста в любом порядке. Каждое касание притягивается к ближайшему
+// настоящему углу, затем рамка строится и уточняется по краям сама.
+let tapBusy = false;
+
+async function onCornerTap(sp) {
+  if (ar.mode !== 'select' || ar.selectQuad || tapBusy || ar.corners.length >= 4) return;
+  const v = stage.toVideo(sp);
+  if (v[0] < 0 || v[1] < 0 || v[0] > stage.vw || v[1] > stage.vh) return;
+  if (ar.corners.some((c) => dist(stage.toScreen(c.p), sp) < 26)) { toast('Этот угол уже отмечен', { ms: 1500 }); return; }
+  tapBusy = true;
+  const c = { tap: v, p: v, snapped: false, pending: true };
+  ar.corners.push(c);
+  updateArUi();
+  try {
+    const r = await tracker.snapCorner(v, ar.corners.filter((x) => x !== c && !x.pending).map((x) => x.p));
+    if (!ar.corners.includes(c)) return; // успели нажать «Назад» / выйти
+    c.p = r.p; c.snapped = r.snapped;
+    if (!r.snapped) toast('Угол не нашёл — оставил там, где нажали', { ms: 1800 });
+  } catch (e) {
+    console.warn('snap', e);
+  } finally {
+    c.pending = false;
+    tapBusy = false;
+  }
+  if (ar.mode === 'select' && ar.corners.length === 4 && ar.corners.includes(c)) await buildSelection();
+  updateArUi();
+}
+
+async function buildSelection() {
+  tapBusy = true;
+  try {
+    const r = await tracker.buildQuad(ar.corners.map((c) => c.tap), ar.corners.map((c) => c.p));
+    if (ar.mode !== 'select' || ar.corners.length !== 4) return;
+    const q = r.quad && clampToView(r.quad);
+    if (!q || !isConvexQuad(q, 400)) {
+      toast('Эти точки не складываются в четырёхугольник. «Назад» — и отметьте угол заново.', { ms: 4500 });
       return;
     }
-    const q = clampToView(orderQuad(detectCands[detectIdx].q));
-    if (isConvexQuad(q, 1000)) ar.selectQuad = q;
-    if (!silent) {
-      const n = detectCands.length;
-      toast(n > 1 ? `Вариант холста ${detectIdx + 1} из ${n}. Не тот? Нажмите «Найти» ещё раз — покажу следующий. Углы можно поправить пальцем.`
-        : 'Найден возможный холст — проверьте и при необходимости поправьте углы');
-    }
-  } catch (e) { if (!silent) toast('Ошибка поиска: ' + e.message); }
+    ar.selectQuad = q;
+  } catch (e) {
+    console.error(e);
+    toast('Не удалось построить рамку: ' + e.message);
+  } finally {
+    tapBusy = false;
+  }
+}
+
+/** «Назад»: убрать последний отмеченный угол (после построения рамки — вернуться к выбору углов). */
+function selectBack() {
+  if (ar.mode !== 'select') return;
+  ar.selectQuad = null;
+  ar.corners.pop();
+  updateArUi();
+}
+
+// одиночное касание по сцене = отметка угла (перетаскивание и щипок касанием не считаются)
+const tap = { id: null, x: 0, y: 0, t: 0 };
+function bindTaps() {
+  const el = stage.el;
+  el.addEventListener('pointerdown', (e) => {
+    if (ar.mode !== 'select' || ar.selectQuad || (e.target.closest && e.target.closest('.ui-block'))) return;
+    if (tap.id !== null) { tap.id = null; return; } // второй палец — не касание
+    Object.assign(tap, { id: e.pointerId, x: e.clientX, y: e.clientY, t: performance.now() });
+  });
+  el.addEventListener('pointerup', (e) => {
+    if (e.pointerId !== tap.id) return;
+    const ok = Math.hypot(e.clientX - tap.x, e.clientY - tap.y) < 14 && performance.now() - tap.t < 800;
+    tap.id = null;
+    if (ok) onCornerTap(stage.eventPoint(e));
+  });
+  el.addEventListener('pointercancel', () => { tap.id = null; });
 }
 
 async function arStart() {
-  if (ar.mode !== 'select') return;
+  if (ar.mode !== 'select' || !ar.selectQuad) return;
   const q = ar.selectQuad;
   try {
     const r = await tracker.lock(q, { fullFrame: S.surroundings });
+    freezeVideo(false); // дальше трекинг идёт по живому видео
     ar.refCanvas = q;
     ar.H = IDENTITY;
     ar.vel = null; ar.lastRaw = null;
@@ -299,7 +355,8 @@ function arStop(silent = false) {
   if (ar.mode === 'tracking' && displayQuad) overlayQuad = displayQuad.map((p) => [...p]);
   tracker.stop();
   ar.mode = 'off';
-  ar.refCanvas = null; ar.refOverlay = null; ar.selectQuad = null;
+  ar.refCanvas = null; ar.refOverlay = null; ar.selectQuad = null; ar.corners = [];
+  freezeVideo(false);
   ar.H = IDENTITY;
   saveQuad();
   updateArUi();
@@ -337,6 +394,13 @@ function updateArUi() {
   btn.classList.toggle('on', ar.mode === 'tracking' || ar.mode === 'select');
   btn.classList.toggle('busy', ar.mode === 'loading');
   $('#ar-select-bar').hidden = ar.mode !== 'select';
+  if (ar.mode === 'select') {
+    const n = ar.corners.length, done = !!ar.selectQuad;
+    $('#ar-hint').textContent = done ? 'Всё верно?' : 'Нажмите на углы холста';
+    $$('#ar-dots i').forEach((d, i) => d.classList.toggle('on', i < n));
+    $('#ar-back').disabled = n === 0;
+    $('#ar-start').disabled = !done;
+  }
   $('.toolbar').classList.toggle('dimmed', ar.mode === 'select');
   pill.hidden = ar.mode === 'off';
   pill.className = 'pill';
@@ -392,9 +456,22 @@ function frame(t) {
     const q = ar.selectQuad;
     svg += `<polygon class="sel-shade" points="${pts(q)}"/>`;
     svg += `<polygon class="sel" points="${pts(q)}"/>`;
-    q.forEach((p, i) => {
+    q.forEach((p) => {
       const [x, y] = stage.toScreen(p);
-      svg += `<circle class="handle sel-h" cx="${x}" cy="${y}" r="15"/><text class="hlabel" x="${x}" y="${y + 5}">${i + 1}</text>`;
+      svg += `<circle class="handle sel-h" cx="${x}" cy="${y}" r="13"/>`;
+    });
+  } else if (ar.mode === 'select' && ar.corners.length) {
+    // отмеченные углы; с трёх точек показываем контур будущей рамки
+    const cs = ar.corners.filter((c) => !c.pending);
+    if (cs.length >= 2) {
+      const poly = cs.length >= 3 ? orderQuad(cs.map((c) => c.p)) : cs.map((c) => c.p);
+      svg += `<polyline class="sel-prev" points="${pts(cs.length >= 3 ? [...poly, poly[0]] : poly)}"/>`;
+    }
+    ar.corners.forEach((c, i) => {
+      const [x, y] = stage.toScreen(c.p);
+      svg += c.pending
+        ? `<circle class="mark pend" cx="${x}" cy="${y}" r="14"/>`
+        : `<circle class="mark ${c.snapped ? 'snap' : 'free'}" cx="${x}" cy="${y}" r="13"/><text class="hlabel" x="${x}" y="${y + 5}">${i + 1}</text>`;
     });
   }
   if (ar.mode === 'tracking' && S.showCanvasFrame && ar.refCanvas) {
@@ -594,6 +671,7 @@ async function updateCameraControls() {
 const escapeHtml = (s) => s.replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
 
 function bind() {
+  bindTaps();
   $('#btn-start').onclick = boot;
   $('#btn-image').onclick = () => $('#file').click();
   $('#btn-load-image').onclick = () => $('#file').click();
@@ -655,7 +733,7 @@ function bind() {
   $('#btn-pause').onclick = togglePause;
   $('#btn-photo').onclick = takePhoto;
   $('#btn-ar').onclick = () => (ar.mode === 'off' ? arBegin() : ar.mode === 'select' || ar.mode === 'tracking' ? arStop() : null);
-  $('#ar-auto').onclick = () => autoDetect(false);
+  $('#ar-back').onclick = selectBack;
   $('#ar-cancel').onclick = () => arStop(true);
   $('#ar-start').onclick = arStart;
 
@@ -797,6 +875,6 @@ async function init() {
 }
 
 // для отладки и автотестов
-window.artcam = { S, ar, DEBUG, filter, stage, tracker, camera, recorder, ref, get overlayQuad() { return overlayQuad; }, get displayQuad() { return displayQuad; }, arBegin, arStart, arStop, loadReference };
+window.artcam = { S, ar, DEBUG, filter, onCornerTap, stage, tracker, camera, recorder, ref, get overlayQuad() { return overlayQuad; }, get displayQuad() { return displayQuad; }, arBegin, arStart, arStop, loadReference };
 
 init();

@@ -1,0 +1,32 @@
+<!doctype html><body><script type="module">
+// Притягивание касаний к углам на одном изображении. ?img=...&taps=[[x,y],...] (пиксели исходного изображения)
+const P = new URLSearchParams(location.search);
+const CV = 'https://cdn.jsdelivr.net/npm/@techstark/opencv-js@4.10.0-release.1/dist/opencv.js';
+const img = new Image(); img.src = P.get('img'); await img.decode();
+const taps = JSON.parse(P.get('taps'));
+const MAX = 640, s = Math.min(1, MAX / Math.max(img.width, img.height));
+const w = Math.round(img.width * s), h = Math.round(img.height * s);
+const c = document.createElement('canvas'); c.width = w; c.height = h;
+const ctx = c.getContext('2d', { willReadFrequently: true });
+ctx.drawImage(img, 0, 0, w, h);
+const worker = new Worker('/app/js/tracker.worker.js');
+let id = 0; const pend = new Map();
+worker.onmessage = (e) => { const p = pend.get(e.data.id); pend.delete(e.data.id); e.data.type === 'error' ? p.rej(new Error(e.data.message)) : p.res(e.data); };
+const call = (m) => new Promise((res, rej) => { const i = ++id; pend.set(i, { res, rej }); const buf = ctx.getImageData(0, 0, w, h).data.buffer; worker.postMessage({ ...m, buf, w, h, id: i }, [buf]); });
+const sc = (p) => [p[0] * s, p[1] * s], un = (p) => [p[0] / s, p[1] / s];
+try {
+  await call({ type: 'init', urls: [CV] });
+} catch {}
+try {
+  const out = [], pts = [];
+  const t0 = performance.now();
+  for (const t of taps) {
+    const r = await call({ type: 'snap', point: sc(t), others: pts.map(sc) });
+    out.push({ snapped: r.snapped, score: r.score, p: un(r.p) });
+    pts.push(un(r.p));
+  }
+  const ms = (performance.now() - t0) / taps.length;
+  const q = pts.length === 4 ? await call({ type: 'quad', taps: taps.map(sc), snapped: pts.map(sc), second: P.get('second') !== '0' }) : null;
+  window.result = { snaps: out, corners: q && q.corners && q.corners.map(un), quad: q && q.quad && q.quad.map(un), refined: q && q.refined, ms, size: [img.width, img.height] };
+} catch (e) { window.result = { error: String(e && e.message || e) }; }
+</script>
