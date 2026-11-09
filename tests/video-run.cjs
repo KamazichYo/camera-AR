@@ -23,10 +23,15 @@ function loadRef() {
   return fs.existsSync(f) ? JSON.parse(fs.readFileSync(f, 'utf8')) : null;
 }
 
-async function runVideo({ taps, step = 1, n = 161, port = 8830, dir }) {
+async function runVideo({ taps, step = 1, n = 161, port = 8830, dir, full = false, noAuto = false, anchors = null }) {
   const { page, errors, close, url } = await launch({ port });
   const q = new URLSearchParams({ taps: JSON.stringify(taps), step: String(step), n: String(n) });
   if (dir) q.set('dir', dir);
+  if (full) q.set('full', '1');
+  if (noAuto) q.set('noauto', '1');
+  if (process.env.SLOW) q.set('slow', process.env.SLOW);
+  if (anchors) q.set('anchors', JSON.stringify(anchors));
+  if (process.env.DBG) q.set('dbg', '1');
   await page.goto(`${url}/t/video-harness.html?${q}`);
   await page.waitForFunction(() => window.result, null, { timeout: 600000 });
   const r = await page.evaluate(() => window.result);

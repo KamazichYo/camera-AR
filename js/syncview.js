@@ -16,6 +16,9 @@ import { applyQuad } from './geometry.js';
 const MAX_RING = 24;      // кадров в буфере (≈ 0,8 с)
 const MAX_POSES = 40;
 const MAX_EXTRAP = 120;   // мс: дальше последней позы экстраполируем не больше (при простое трекера)
+const WIDTHS = [1280, 960, 720, 540]; // ширина кадра показа; на слабом телефоне идём вниз по лесенке
+const GRAB_SLOW_MS = 22;  // createImageBitmap дольше этого (в среднем) — телефон не успевает: уменьшаем кадр
+const DRAW_SLOW_MS = 9;   // отрисовка кадра в canvas дольше этого — то же
 
 export class SyncView {
   constructor(video, canvas) {
@@ -33,19 +36,34 @@ export class SyncView {
     this.shown = null;    // кадр, нарисованный в canvas
     this.minDelay = 30;
     this.maxDelay = 320;
+    this.level = 0;       // индекс в WIDTHS
+    this.grabMs = 0;      // EMA: сколько ждём createImageBitmap
+    this.drawMs = 0;      // EMA: сколько рисуем кадр в canvas
+    this.inflight = 0;    // запущенные, но ещё не готовые снимки кадров
+    this.fails = 0;       // подряд неудачных снимков
+    this.failed = false;  // показ невозможен/слишком тяжёл — приложение возвращается к обычному видео
+    this.noOpts = false;  // браузер не понимает параметры createImageBitmap (старый iOS) — снимаем целиком
+    this.slowChecks = 0;
   }
 
   get supported() {
     return 'requestVideoFrameCallback' in this.video && typeof createImageBitmap === 'function';
   }
 
-  start(maxWidth = 1280) {
-    if (!this.supported || this.active) return this.active;
+  _setWidth(maxWidth) {
     const vw = this.video.videoWidth, vh = this.video.videoHeight;
-    if (!vw) return false;
-    const k = Math.min(1, maxWidth / vw);
+    const k = Math.min(1, maxWidth / Math.max(vw, vh)); // ограничиваем длинную сторону
     this.bw = Math.round(vw * k); this.bh = Math.round(vh * k);
     this.canvas.width = this.bw; this.canvas.height = this.bh;
+    this.shown = null; // canvas очищен — следующий кадр нарисуется заново
+  }
+
+  start(maxWidth = WIDTHS[0]) {
+    if (!this.supported || this.active) return this.active;
+    if (!this.video.videoWidth) return false;
+    this.level = Math.max(0, WIDTHS.findIndex((w) => w <= maxWidth));
+    this.failed = false; this.fails = 0; this.inflight = 0; this.grabMs = 0; this.drawMs = 0; this.slowChecks = 0;
+    this._setWidth(WIDTHS[this.level]);
     this.active = true;
     this.ring = []; this.poses = []; this.shown = null; this.nPoses = 0;
     this.delay = this.target = 90; this.latency = 40; this.period = 40;
@@ -67,10 +85,25 @@ export class SyncView {
   }
 
   async _grab(T) {
+    // не копим очередь снимков: на слабом телефоне она растёт быстрее, чем разбирается
+    if (this.inflight >= 2) return;
+    this.inflight++;
+    const t0 = performance.now();
     let bmp;
     try {
-      bmp = await createImageBitmap(this.video, { resizeWidth: this.bw, resizeHeight: this.bh, resizeQuality: 'low' });
-    } catch { return; }
+      bmp = this.noOpts
+        ? await createImageBitmap(this.video)
+        : await createImageBitmap(this.video, { resizeWidth: this.bw, resizeHeight: this.bh, resizeQuality: 'low' });
+      this.fails = 0;
+    } catch {
+      this.inflight--;
+      // старый браузер не знает параметров — пробуем снимать целиком; не выходит совсем — показ невозможен
+      if (!this.noOpts && this.fails === 0) this.noOpts = true;
+      if (++this.fails >= 6) this.failed = true;
+      return;
+    }
+    this.inflight--;
+    this.grabMs += 0.1 * ((performance.now() - t0) - this.grabMs);
     if (!this.active) { bmp.close && bmp.close(); return; }
     const ring = this.ring;
     let i = ring.length;
@@ -95,6 +128,21 @@ export class SyncView {
     this.target = Math.min(this.maxDelay, Math.max(this.minDelay, this.latency + this.period + 6));
     // первые позы: задержка выставляется сразу (одноразовый скачок при включении AR), дальше — плавно
     if (++this.nPoses <= 6) this.delay = this.target;
+  }
+
+  /**
+   * Самонастройка под слабый телефон: если снимок кадра или его отрисовка стабильно долгие, уменьшаем кадр показа;
+   * на самой нижней ступени и всё ещё тяжело — сообщаем приложению (failed), оно вернётся к обычному видео.
+   */
+  _governor() {
+    if (this.grabMs > GRAB_SLOW_MS || this.drawMs > DRAW_SLOW_MS) this.slowChecks++; else this.slowChecks = Math.max(0, this.slowChecks - 1);
+    if (this.slowChecks < 45) return;
+    this.slowChecks = 0;
+    if (this.level < WIDTHS.length - 1) {
+      this.level++;
+      this.grabMs = this.drawMs = 0;
+      this._setWidth(WIDTHS[this.level]);
+    } else this.failed = true;
   }
 
   /** После правки рамок референса — позы хранятся как H, поэтому пересчёт не нужен; метод нужен для сброса. */
@@ -139,8 +187,11 @@ export class SyncView {
     for (const r of this.ring) { if (r.T <= Td) f = r; else break; }
     if (!f) f = this.ring[0];
     if (f !== this.shown) {
+      const d0 = performance.now();
       this.ctx.drawImage(f.bmp, 0, 0, this.bw, this.bh);
+      this.drawMs += 0.1 * ((performance.now() - d0) - this.drawMs);
       this.shown = f;
+      this._governor();
     }
     // кадры старше показанного больше не нужны
     while (this.ring.length > 2 && this.ring[0].T < f.T - 100) { const o = this.ring.shift(); if (o !== this.shown) o.bmp.close && o.bmp.close(); }

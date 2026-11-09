@@ -32,6 +32,22 @@ const REF = JSON.parse(fs.readFileSync(path.join(DIR, 'ref.json'), 'utf8')); // 
   await p.waitForFunction(() => window.artcam.ar.mode === 'select', null, { timeout: 60000 });
   check(!(await p.evaluate(() => document.querySelector('#video').paused)), 'видео не замирает во время выбора углов');
   check((await p.textContent('#ar-hint')).includes('Нажмите на углы холста'), 'подсказка — «Нажмите на углы холста»');
+  {
+    // никакой плашки сверху: центр верхней трети экрана отдан камере, кнопки выбора — круглые и внизу
+    const ui = await p.evaluate(() => {
+      const vh = innerHeight, vw = innerWidth;
+      const top = document.elementFromPoint(vw / 2, vh * 0.2);
+      const rect = (sel) => { const r = document.querySelector(sel).getBoundingClientRect(); return { t: r.top, h: r.height, w: r.width }; };
+      return {
+        vh, topOk: !!top && !top.closest('.ui-block'), bar: getComputedStyle(document.querySelector('#ar-select-bar')).pointerEvents,
+        back: rect('#ar-back'), cancel: rect('#ar-cancel'), hint: rect('#ar-hint'),
+        plate: !!document.querySelector('.sel-pill'),
+      };
+    });
+    check(ui.topOk && !ui.plate, 'сверху нет плашки: верхняя часть экрана свободна под камеру');
+    check(ui.back.t > ui.vh * 0.6 && ui.cancel.t > ui.vh * 0.6 && Math.abs(ui.back.w - ui.back.h) < 1, 'кнопки «назад» и «отмена» — круглые и внизу');
+    check(ui.bar === 'none', 'блок выбора пропускает касания (углы можно отмечать и под ним)');
+  }
 
   // касания: углы 2,0,3,1 (BR, TL, BL, TR), «палец» промахивается на 7–12 px
   const jit = [[9, -7], [-8, 6], [7, 9], [-6, -8]];
@@ -79,6 +95,23 @@ const REF = JSON.parse(fs.readFileSync(path.join(DIR, 'ref.json'), 'utf8')); // 
   const med = errs[errs.length >> 1], max = errs[errs.length - 1];
   check(n >= 12 && lost <= 1, `трекинг держится на ${n - lost} из ${n} проверок`);
   check(med < 4 && max < 9, `рамка остаётся на холсте при движении камеры (ошибка мед. ${med?.toFixed(1)} px, макс. ${max?.toFixed(1)} px)`);
+  // точки опоры: кнопка → касания по сцене → маркеры; «готово» закрывает режим, метки остаются
+  await p.click('#btn-anchor');
+  check(await p.evaluate(() => document.body.classList.contains('anchoring') && !document.querySelector('#ar-select-bar').hidden), 'режим точек опоры включился (кнопка вверху, управление внизу)');
+  const [ax, ay] = await p.evaluate(() => { const s = window.artcam.stage; return s.toScreen([s.vw * 0.12, s.vh * 0.85]); });
+  await p.mouse.click(ax, ay);
+  await p.waitForFunction(() => window.artcam.ar.anchors.length === 1, null, { timeout: 5000 });
+  await p.waitForTimeout(300);
+  check(await p.evaluate(() => document.querySelectorAll('#ui-layer .anchor-ring').length === 1), 'точка опоры отмечена и нарисована');
+  await shot('5-anchor');
+  await p.click('#ar-back');
+  check(await p.evaluate(() => window.artcam.ar.anchors.length === 0), '«Назад» убирает последнюю точку опоры');
+  await p.mouse.click(ax, ay);
+  await p.waitForFunction(() => window.artcam.ar.anchors.length === 1, null, { timeout: 5000 });
+  await p.click('#ar-cancel');
+  check(await p.evaluate(() => !document.body.classList.contains('anchoring') && document.querySelector('#ar-select-bar').hidden && window.artcam.ar.anchors.length === 1), '«Готово» закрывает режим, точка остаётся');
+  await p.waitForTimeout(400);
+  check(await p.evaluate(() => window.artcam.ar.state === 'tracking'), 'трекинг идёт и с точкой опоры');
   check(errors.length === 0, 'без ошибок в консоли ' + (errors.length ? JSON.stringify(errors.slice(0, 3)) : ''));
   await close();
 })().catch((e) => { console.error(e); process.exit(1); });

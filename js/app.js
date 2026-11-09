@@ -1,6 +1,6 @@
 // ArtCam — камера художника: запись процесса, референс поверх холста, AR-привязка.
 import {
-  IDENTITY, applyQuad, invert, cssMatrix3d, fitRect, fitIntoQuad, centroid, similarity,
+  IDENTITY, apply, applyQuad, invert, cssMatrix3d, fitRect, fitIntoQuad, centroid, similarity,
   isConvexQuad, QuadKalman, orderQuad, dist,
 } from './geometry.js';
 import { Stage, QuadEditor } from './stage.js';
@@ -43,6 +43,8 @@ const ar = {
   state: 'tracking',               // tracking | lost
   H: IDENTITY,                     // опорный кадр → текущий (координаты видео)
   corners: [],                     // отмеченные углы (их ведёт воркер): { p, snapped, lost }
+  anchors: [],                     // точки опоры (неподвижные предметы), в координатах опорного кадра
+  anchorMode: false,               // идёт отметка точек опоры
   pendingTap: null,                // касание, которое ещё притягивается к углу: [x, y]
   refCanvas: null,                 // холст в опорном кадре
   refOverlay: null,                // референс в опорном кадре
@@ -215,7 +217,7 @@ const overlayEditor = new QuadEditor(stage, {
 });
 
 function updateEditors() {
-  overlayEditor.enabled = ar.mode !== 'select' && ref.loaded && !S.pinned && S.visible;
+  overlayEditor.enabled = ar.mode !== 'select' && !ar.anchorMode && ref.loaded && !S.pinned && S.visible;
 }
 
 // ---------- AR ----------
@@ -295,12 +297,41 @@ async function selectBack() {
   updateArUi();
 }
 
+// ---------- точки опоры ----------
+// Неподвижные предметы рядом с холстом (стол, подставка, лента, провод): их точки ведутся потоком вместе с холстом и
+// держат позу, когда сам холст закрыт рукой или у него нет деталей. Точки хранятся в опорных координатах.
+async function onAnchorTap(sp) {
+  if (ar.mode !== 'tracking' || !ar.anchorMode) return;
+  const v = stage.toVideo(sp);
+  if (v[0] < 0 || v[1] < 0 || v[0] > stage.vw || v[1] > stage.vh) return;
+  const inv = invert(ar.H);
+  if (!inv) return;
+  if (ar.anchors.length >= 8) { toast('Достаточно: до 8 точек опоры', { ms: 1800 }); return; }
+  if (ar.anchors.some((a) => dist(stage.toScreen(apply(ar.H, a)), sp) < 30)) { toast('Здесь точка уже есть', { ms: 1200 }); return; }
+  ar.anchors.push(apply(inv, v));
+  updateArUi();
+  try { await tracker.addAnchor(v); } catch (e) { console.error(e); ar.anchors.pop(); updateArUi(); }
+}
+
+async function anchorBack() {
+  if (!ar.anchors.length) return;
+  ar.anchors.pop();
+  updateArUi();
+  try { await tracker.removeAnchor(false); } catch { /* не критично */ }
+}
+
+function setAnchorMode(on) {
+  if (on && ar.mode !== 'tracking') return;
+  ar.anchorMode = on;
+  updateArUi();
+}
+
 // одиночное касание по сцене = отметка угла (перетаскивание и щипок касанием не считаются)
 const tap = { id: null, x: 0, y: 0, t: 0 };
 function bindTaps() {
   const el = stage.el;
   el.addEventListener('pointerdown', (e) => {
-    if (ar.mode !== 'select' || (e.target.closest && e.target.closest('.ui-block'))) return;
+    if (!(ar.mode === 'select' || (ar.mode === 'tracking' && ar.anchorMode)) || (e.target.closest && e.target.closest('.ui-block'))) return;
     if (tap.id !== null) { tap.id = null; return; } // второй палец — не касание
     Object.assign(tap, { id: e.pointerId, x: e.clientX, y: e.clientY, t: performance.now() });
   });
@@ -308,7 +339,7 @@ function bindTaps() {
     if (e.pointerId !== tap.id) return;
     const ok = Math.hypot(e.clientX - tap.x, e.clientY - tap.y) < 14 && performance.now() - tap.t < 800;
     tap.id = null;
-    if (ok) onCornerTap(stage.eventPoint(e));
+    if (ok) (ar.mode === 'select' ? onCornerTap : onAnchorTap)(stage.eventPoint(e));
   });
   el.addEventListener('pointercancel', () => { tap.id = null; });
 }
@@ -321,6 +352,7 @@ function onLocked(info) {
   ar.state = 'tracking';
   ar.lostSince = 0;
   ar.corners = [];
+  ar.anchors = []; ar.anchorMode = false;
   // референс сразу ложится на холст (его потом можно подвинуть)
   if (ref.loaded) { overlayQuad = fitIntoQuad(ref.aspect, q); S.visible = true; }
   ar.refOverlay = overlayQuad ? overlayQuad.map((p) => [...p]) : null;
@@ -341,6 +373,7 @@ function arStop(silent = false) {
   document.body.classList.remove('synced');
   ar.mode = 'off';
   ar.refCanvas = null; ar.refOverlay = null; ar.corners = []; ar.pendingTap = null; lostWarned = false; noCornerHinted = false;
+  ar.anchors = []; ar.anchorMode = false;
   ar.H = IDENTITY;
   saveQuad();
   updateArUi();
@@ -350,6 +383,11 @@ function arStop(silent = false) {
 tracker.onPose = (H, info, frameTime) => {
   if (ar.mode !== 'tracking') return;
   ar.info = info;
+  if (info.anchorsDropped && ar.anchors.length) {
+    ar.anchors = [];
+    toast('Точки опоры не согласуются с холстом (его двигают отдельно от окружения) — отключил. Отметьте их заново, если холст снова неподвижен.', { ms: 6000 });
+    updateArUi();
+  }
   if (info.state === 'tracking') {
     if (ar.state !== 'tracking') resetSmoothing(); // после потери поза могла «прыгнуть»
     // поза относится к кадру, показанному в момент frameTime — в фильтр она идёт с этим временем
@@ -377,18 +415,32 @@ function updateArUi() {
   const btn = $('#btn-ar');
   btn.classList.toggle('on', ar.mode === 'tracking' || ar.mode === 'select');
   btn.classList.toggle('busy', ar.mode === 'loading');
-  $('#ar-select-bar').hidden = ar.mode !== 'select';
+  const anchoring = ar.mode === 'tracking' && ar.anchorMode;
+  $('#ar-select-bar').hidden = !(ar.mode === 'select' || anchoring);
   document.body.classList.toggle('selecting', ar.mode === 'select');
+  document.body.classList.toggle('anchoring', anchoring);
   if (ar.mode === 'select') {
     const n = ar.corners.length;
     $$('#ar-dots i').forEach((d, i) => d.classList.toggle('on', i < n));
     $('#ar-back').disabled = n === 0;
+    $('#ar-back').title = 'Назад — убрать последний угол';
+    $('#ar-cancel').title = 'Отмена';
+    $('#ar-hint').textContent = 'Нажмите на углы холста';
+  } else if (anchoring) {
+    const n = ar.anchors.length;
+    $('#ar-back').disabled = n === 0;
+    $('#ar-back').title = 'Назад — убрать последнюю точку опоры';
+    $('#ar-cancel').title = 'Готово';
+    $('#ar-hint').textContent = n ? 'Точек опоры: ' + n + '. Ещё — нажмите на неподвижный предмет' : 'Нажмите на неподвижные предметы рядом: стол, провод. Не руки и не карандаш';
   }
-  $('.toolbar').classList.toggle('dimmed', ar.mode === 'select');
+  const btnAnchor = $('#btn-anchor');
+  btnAnchor.hidden = ar.mode !== 'tracking';
+  btnAnchor.classList.toggle('on', anchoring);
+  $('.toolbar').classList.toggle('dimmed', ar.mode === 'select' || anchoring);
   pill.hidden = ar.mode === 'off';
   pill.className = 'pill';
   if (ar.mode === 'loading') { pill.textContent = 'AR: загрузка…'; }
-  else if (ar.mode === 'select') { pill.textContent = 'AR: выбор холста'; }
+  else if (ar.mode === 'select') { pill.textContent = 'AR: углы ' + ar.corners.length + '/4'; }
   else if (ar.mode === 'tracking') {
     const lost = ar.state !== 'tracking';
     pill.textContent = lost ? 'AR: холст потерян' : 'AR: отслеживание';
@@ -407,6 +459,12 @@ function frame(t) {
   // Синхронный показ: выбираем кадр с небольшой задержкой и интерполируем позу между соседними обработанными
   // кадрами — картинка и референс двигаются жёстко вместе. Без поддержки — фильтр Калмана на момент показанного кадра.
   let syncT = null;
+  if (sync.active && sync.failed) {
+    // телефон не успевает снимать кадры для показа (или браузер не умеет) — обычное видео и фильтр Калмана
+    sync.stop();
+    document.body.classList.remove('synced');
+    toast('Плавный показ выключен: устройство не успевает. Рамка ведётся по обычному видео.', { ms: 5000 });
+  }
   if (sync.active && ar.mode === 'tracking') {
     syncT = sync.frame(t);
     if (syncT !== null && !document.body.classList.contains('synced')) document.body.classList.add('synced');
@@ -457,6 +515,14 @@ function frame(t) {
       svg += `<circle class="mark pend" cx="${x}" cy="${y}" r="14"/>`;
     }
   }
+  if (ar.mode === 'tracking' && ar.anchors.length) {
+    // точки опоры стоят на предметах: позиция — на момент показанного кадра, как и у рамок
+    const qa = (syncT !== null && sync.quadAt(syncT, ar.anchors)) || applyQuad(ar.H, ar.anchors);
+    for (const p of qa) {
+      const [x, y] = stage.toScreen(p);
+      svg += '<circle class="anchor-ring" cx="' + x.toFixed(1) + '" cy="' + y.toFixed(1) + '" r="10"/><circle class="anchor-dot" cx="' + x.toFixed(1) + '" cy="' + y.toFixed(1) + '" r="2.5"/>';
+    }
+  }
   if (ar.mode === 'tracking' && S.showCanvasFrame && ar.refCanvas) {
     const q = canvasQuad || kfCanvas.predict(ar.shownT || t, DEBUG.predict) || applyQuad(ar.H, ar.refCanvas);
     if (isConvexQuad(q)) svg += `<polygon class="canvas-frame ${ar.state}" points="${pts(q)}"/>`;
@@ -473,7 +539,7 @@ function frame(t) {
   // статистика
   if (S.stats && ar.mode === 'tracking' && ar.info) {
     const i = ar.info;
-    $('#stats').textContent = `${tracker.stats.fps} к/с · ${i.ms} мс · точек ${i.points} · inl ${i.inliers} · kf ${i.keyframes} · ${i.source}${sync.active ? ' · показ с задержкой ' + Math.round(sync.delay) + ' мс' : ''}`;
+    $('#stats').textContent = `${tracker.stats.fps} к/с · ${i.ms} мс · точек ${i.points} · inl ${i.inliers} · kf ${i.keyframes} · ${i.source}${sync.active ? ' · показ с задержкой ' + Math.round(sync.delay) + ' мс, кадр ' + sync.bw + '×' + sync.bh + ' (' + sync.grabMs.toFixed(0) + '+' + sync.drawMs.toFixed(0) + ' мс)' : ''} · анализ ${tracker.procMax}px`;
   } else $('#stats').textContent = '';
 
   // таймер записи
@@ -716,8 +782,9 @@ function bind() {
   $('#btn-pause').onclick = togglePause;
   $('#btn-photo').onclick = takePhoto;
   $('#btn-ar').onclick = () => (ar.mode === 'off' ? arBegin() : ar.mode === 'select' || ar.mode === 'tracking' ? arStop() : null);
-  $('#ar-back').onclick = selectBack;
-  $('#ar-cancel').onclick = () => arStop(true);
+  $('#ar-back').onclick = () => (ar.mode === 'tracking' ? anchorBack() : selectBack());
+  $('#ar-cancel').onclick = () => (ar.mode === 'tracking' ? setAnchorMode(false) : arStop(true));
+  $('#btn-anchor').onclick = () => setAnchorMode(!ar.anchorMode);
 
   $('#media-save').onclick = saveMedia;
   $('#media-share').onclick = shareMedia;

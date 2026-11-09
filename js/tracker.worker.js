@@ -35,6 +35,12 @@ const CFG = {
   tmplCorners: 160,       // точек в шаблоне для уточнения позы
   wPersp: 0.6,            // вес штрафа за перспективу в оптимизаторе
   coastMax: 8,            // сколько кадров подряд ехать по инерции при сбое, прежде чем объявить потерю
+  edgeGate: 100,            // px: когда поза по потоку надёжна, край ищется только в такой окрестности предсказания
+  envEdgeErr: 4.5,        // px: края листа стабильно дальше этого от позы по фону — лист двигают отдельно от окружения
+  liteMs: 55,             // среднее время кадра выше этого (слабый телефон) — включается облегчённый режим (ниже 0.75× — выключается)
+  anchorPts: 14,          // сколько точек потока держим в каждой опорной области
+  anchorR: 34,            // px (кадра анализа): радиус опорной области
+  autoEnvPts: 30,        // меньше стольких собственных точек у холста (пустая бумага) — окружение подключается само
   eccEvery: 8,            // как часто (в кадрах) выравнивать по заплатке, когда точек хватает (богатая фактура)
   eccSparse: 70,          // меньше стольких точек потока — подключаем плотное выравнивание (ECC)
   minPointStd: 6,         // минимальный локальный контраст точки (уровней) — не цепляться за шум
@@ -46,7 +52,8 @@ const CFG = {
   ratio: 0.78,            // тест Лоу
   minInliersLK: 8,
   minInliersORB: 16,
-  relocEvery: 20,         // кадров между проверками дрейфа (ORB)
+  relocEvery: 20,
+  relocEnv: 8,            // в режиме окружения абсолютную поверхность проверяем чаще         // кадров между проверками дрейфа (ORB)
   driftFix: 5,            // px — если ORB и трекинг расходятся больше, доверяем ORB
   keyframeEveryMs: 2500,
   maxKeyframes: 6,
@@ -394,12 +401,13 @@ function dropState() {
   st.keyframes.forEach((k) => k.desc.delete());
   if (st.tmpl) { st.tmpl.img.delete(); st.tmpl.crop.delete(); if (st.tmpl.ecc) st.tmpl.ecc.T.delete(); }
   if (st.eccRecent) st.eccRecent.delete();
-  st.tmpl = null; st.eccRecent = null;
+  if (st.skin) st.skin.delete();
+  st.tmpl = null; st.eccRecent = null; st.skin = null;
 }
 
 /** Сопоставление ORB текущего кадра с ключевыми кадрами. */
 function relocalize(img, Hguess) {
-  const mask = Hguess ? polyMask(mapQuad(Hguess, expandQuad(st.quad, 0.25))) : new cv.Mat();
+  const mask = Hguess && !st.fullFrame ? polyMask(mapQuad(Hguess, expandQuad(st.quad, 0.25))) : new cv.Mat();
   const cur = orbDetect(img, mask);
   mask.delete();
   let best = null;
@@ -518,7 +526,15 @@ function lkPairs(imgA, imgB, ptsA, win, levels, backCheck = true) {
 
 /** Межкадровый трекинг: быстрый прогноз позы. */
 function trackLK() {
-  const { idx, out } = lkPairs(prevNorm, norm, st.cur, CFG.lkWin, CFG.lkLevels, CFG.lkBackCheck);
+  const lkr = lkPairs(prevNorm, norm, st.cur, CFG.lkWin, CFG.lkLevels, CFG.lkBackCheck);
+  let idx = lkr.idx, out = lkr.out;
+  // точки, попавшие на руку, — не опора: движущаяся рука иначе образует самую большую согласованную группу
+  // и RANSAC принимает её движение за движение бумаги
+  if (st.skinOn && st.skin) {
+    const ki = [], ko = [];
+    for (let k = 0; k < idx.length; k++) if (!onSkin(st.skin, out[k * 2], out[k * 2 + 1])) { ki.push(idx[k]); ko.push(out[k * 2], out[k * 2 + 1]); }
+    idx = ki; out = ko;
+  }
   if (idx.length < CFG.minInliersLK) return null;
   const ref = [];
   for (const i of idx) ref.push(st.ref[i * 2], st.ref[i * 2 + 1]);
@@ -534,13 +550,52 @@ function trackLK() {
 }
 
 /** Засеять точки для оптического потока в текущем кадре по позе Hm. */
+/**
+ * Признаки по ячейкам сетки в области маски: опорные точки равномерно по всей области, а не кучей в самом
+ * контрастном месте. Иначе геометрия вырождена (все точки внизу), и дальние части рамки плывут.
+ * exclude — уже имеющиеся точки (плоский массив x,y): они учитываются в квотах ячеек.
+ */
+function detectGrid(mask, total, exclude) {
+  const bb = cv.boundingRect(mask);
+  if (bb.width < 24 || bb.height < 24) return detectCorners(gray, mask, total, exclude, norm);
+  const G = st.fullFrame ? 4 : 3;
+  const perCell = Math.ceil(CFG.maxCorners / (G * G)) + 2;
+  const out = [];
+  for (let gy = 0; gy < G; gy++) {
+    for (let gx = 0; gx < G; gx++) {
+      const rx = Math.round(bb.x + gx * bb.width / G), ry = Math.round(bb.y + gy * bb.height / G);
+      const rw = Math.round(bb.x + (gx + 1) * bb.width / G) - rx, rh = Math.round(bb.y + (gy + 1) * bb.height / G) - ry;
+      if (rw < 8 || rh < 8) continue;
+      let have = 0;
+      const ex = [];
+      for (let i = 0; i < (exclude || []).length; i += 2) {
+        const x = exclude[i], y = exclude[i + 1];
+        if (x >= rx && x < rx + rw && y >= ry && y < ry + rh) { have++; ex.push(x - rx, y - ry); }
+      }
+      const need = perCell - have;
+      if (need < 3) continue;
+      const rect = new cv.Rect(rx, ry, rw, rh);
+      const m = mask.roi(rect).clone();
+      if (cv.countNonZero(m) > 150) {
+        const g = gray.roi(rect).clone(), n = norm.roi(rect).clone();
+        const pts = detectCorners(g, m, need, ex, n);
+        for (let i = 0; i < pts.length; i += 2) out.push(pts[i] + rx, pts[i + 1] + ry);
+        g.delete(); n.delete();
+      }
+      m.delete();
+    }
+  }
+  return out;
+}
+
 function seedPoints(Hm, keep) {
   const mask = currentMask(Hm);
+  if (st.skinOn && st.skin) cv.subtract(mask, st.skin, mask);
   const curPts = keep ? Array.from(st.cur) : [];
   const refPts = keep ? Array.from(st.ref) : [];
   const need = CFG.maxCorners - curPts.length / 2;
   if (need > 10) {
-    const fresh = detectCorners(gray, mask, need, curPts, norm);
+    const fresh = detectGrid(mask, need, curPts);
     const inv = invertH(Hm);
     for (let i = 0; i < fresh.length; i += 2) {
       const r = applyH(inv, fresh[i], fresh[i + 1]);
@@ -549,9 +604,63 @@ function seedPoints(Hm, keep) {
     }
   }
   mask.delete();
+  seedAnchors(Hm, curPts, refPts);
   st.cur = Float32Array.from(curPts);
   st.ref = Float32Array.from(refPts);
 }
+
+/** Опорные области (точки опоры): круги вокруг отмеченных пользователем неподвижных предметов, в текущем кадре. */
+function anchorDiscs(Hm) {
+  return st.anchors.map((a) => {
+    const c = applyH(Hm, a.ref[0], a.ref[1]), e = applyH(Hm, a.ref[0] + a.r, a.ref[1]);
+    return { c, r: Math.max(10, Math.hypot(e[0] - c[0], e[1] - c[1])) };
+  });
+}
+
+/** В каждой опорной области держим свои точки потока: они входят в общую гомографию вместе с точками холста. */
+function seedAnchors(Hm, curPts, refPts) {
+  if (!st.anchors.length) return;
+  const inv = invertH(Hm);
+  if (!inv) return;
+  for (const d of anchorDiscs(Hm)) {
+    if (d.c[0] < -d.r || d.c[1] < -d.r || d.c[0] > W + d.r || d.c[1] > H + d.r) continue;
+    const ex = [];
+    let have = 0;
+    for (let i = 0; i < curPts.length; i += 2) {
+      if (Math.hypot(curPts[i] - d.c[0], curPts[i + 1] - d.c[1]) < d.r) { have++; ex.push(curPts[i], curPts[i + 1]); }
+    }
+    const need = CFG.anchorPts - have;
+    if (need < 4) continue;
+    const m = cv.Mat.zeros(H, W, cv.CV_8UC1);
+    cv.circle(m, new cv.Point(Math.round(d.c[0]), Math.round(d.c[1])), Math.round(d.r), new cv.Scalar(255), -1);
+    if (st.skinOn && st.skin) cv.subtract(m, st.skin, m);
+    const fresh = detectCorners(gray, m, need, ex, norm);
+    m.delete();
+    for (let i = 0; i < fresh.length; i += 2) {
+      const r = applyH(inv, fresh[i], fresh[i + 1]);
+      curPts.push(fresh[i], fresh[i + 1]);
+      refPts.push(r[0], r[1]);
+    }
+  }
+}
+
+/** Пользователь отметил неподвижный предмет (точка в текущем кадре анализа). */
+function addAnchor(msg) {
+  if (!st) return { type: 'anchors', anchors: [], n: 0 };
+  const inv = invertH(st.H);
+  const [x, y] = msg.point;
+  if (inv && x >= 0 && y >= 0 && x < W && y < H) {
+    st.anchors.push({ ref: applyH(inv, x, y), r: CFG.anchorR });
+    if (!st.fail) seedPoints(st.H, true);
+  }
+  return { type: 'anchors', n: st.anchors.length, anchors: anchorPositions() };
+}
+function removeAnchor(msg) {
+  if (!st) return { type: 'anchors', anchors: [], n: 0 };
+  if (msg.all) st.anchors = []; else st.anchors.pop();
+  return { type: 'anchors', n: st.anchors.length, anchors: anchorPositions() };
+}
+const anchorPositions = () => (st ? st.anchors.map((a) => applyH(st.H, a.ref[0], a.ref[1])) : []);
 
 /** Пересчитать опорные координаты точек LK по уточнённой позе (убирает их дрейф). */
 function reanchor(Hm) {
@@ -774,38 +883,109 @@ function learnEdges() {
       if (Number.isFinite(o) && Number.isFinite(i)) { sum += o - i; n++; }
     }
     const diff = n ? sum / n : 0;
-    st.edges.push({ use: len > 20 && n >= 8 && Math.abs(diff) >= CFG.edgeMinContrast, pol: Math.sign(diff), contrast: Math.abs(diff) });
+    // цвета внутри (бумага/холст) и снаружи (фон) у грани — чтобы отличать настоящий край от контура руки/карандаша
+    const cin = [], cout = [];
+    let outAll = 0;
+    for (let k = 0; k < 20; k++) {
+      const s2 = 0.1 + 0.8 * k / 19;
+      const x = A[0] + (B[0] - A[0]) * s2, y = A[1] + (B[1] - A[1]) * s2;
+      for (const d of [5, 7, 9]) {
+        const ax = x - nx * d, ay = y - ny * d, bx = x + nx * d, by = y + ny * d;
+        const a = rgbAt(ax, ay), b = rgbAt(bx, by);
+        if (a && !(st.skinOn && st.skin && onSkin(st.skin, ax, ay))) cin.push(a); // рука в кадре при выборе углов не должна портить эталон цвета
+        if (b) outAll++;
+        if (b && !(st.skinOn && st.skin && onSkin(st.skin, bx, by))) cout.push(b);
+      }
+    }
+    const inS = colorStats(cin), outS = colorStats(cout);
+    st.edges.push({
+      use: len > 20 && n >= 8 && Math.abs(diff) >= CFG.edgeMinContrast, pol: Math.sign(diff), contrast: Math.abs(diff),
+      inC: inS.mean, sdIn: inS.sd, outC: outS.mean, sdOut: outS.sd,
+      bgSkin: outAll > 0 && cout.length / outAll < 0.25, // фон сам телесного цвета (стол, дерево): по коже края не отсеиваем
+      useOut: outS.sd < 28 && cout.length > 0, // фон ровный (флис, стол) — по нему можно сверять; пёстрый (чужие предметы) — нет
+    });
   }
+  // одна-единственная «контрастная» сторона — обычно случайность (контур кожи у ладони); край в помощь только когда сторон хватает
+  if (st.edges.filter((e) => e.use).length < 2) for (const e of st.edges) e.use = false;
 }
+
+// ---------- маска кожи (руки не должны считаться опорой) ----------
+let skinLo = null, skinHi = null;
+/** Бинарная маска «кожа» по текущему кадру: YCrCb-диапазон + небольшое расширение. Освобождать вызывающему. */
+function computeSkin() {
+  const rgb = new cv.Mat(), ycc = new cv.Mat(), m = new cv.Mat();
+  cv.cvtColor(rgba, rgb, cv.COLOR_RGBA2RGB);
+  cv.cvtColor(rgb, ycc, cv.COLOR_RGB2YCrCb);
+  if (!skinLo || skinLo.rows !== H || skinLo.cols !== W) {
+    if (skinLo) { skinLo.delete(); skinHi.delete(); }
+    skinLo = new cv.Mat(H, W, cv.CV_8UC3, new cv.Scalar(40, 140, 80));
+    skinHi = new cv.Mat(H, W, cv.CV_8UC3, new cv.Scalar(255, 178, 128));
+  }
+  cv.inRange(ycc, skinLo, skinHi, m);
+  const k = cv.getStructuringElement(cv.MORPH_ELLIPSE, new cv.Size(7, 7));
+  cv.dilate(m, m, k);
+  [rgb, ycc, k].forEach((x) => x.delete());
+  return m;
+}
+const onSkin = (m, x, y) => {
+  const xi = Math.round(x), yi = Math.round(y);
+  return xi >= 0 && yi >= 0 && xi < W && yi < H && m.data[yi * W + xi] > 0;
+};
+
+function rgbAt(x, y) {
+  const xi = Math.round(x), yi = Math.round(y);
+  if (xi < 0 || yi < 0 || xi >= W || yi >= H) return null;
+  const i = (yi * W + xi) * 4;
+  return [rgba.data[i], rgba.data[i + 1], rgba.data[i + 2]];
+}
+function colorStats(list) {
+  if (!list.length) return { mean: [128, 128, 128], sd: 99 };
+  const mean = [0, 0, 0];
+  for (const c of list) for (let k = 0; k < 3; k++) mean[k] += c[k] / list.length;
+  let v = 0;
+  for (const c of list) for (let k = 0; k < 3; k++) v += (c[k] - mean[k]) ** 2;
+  return { mean, sd: Math.sqrt(v / (list.length * 3)) };
+}
+const colorDist = (a, b) => (Math.abs(a[0] - b[0]) + Math.abs(a[1] - b[1]) + Math.abs(a[2] - b[2])) / 3;
 
 /** Прямая по точкам методом RANSAC + уточнение МНК. Возвращает inlier-точки. */
 function fitLine(pts) {
   const n = pts.length;
   if (n < CFG.edgeMinInliers) return null;
-  let best = null;
-  for (let it = 0; it < 40; it++) {
-    const a = pts[(Math.random() * n) | 0], b = pts[(Math.random() * n) | 0];
-    const dx = b[0] - a[0], dy = b[1] - a[1], L = Math.hypot(dx, dy);
-    if (L < 5) continue;
-    const nx = -dy / L, ny = dx / L;
-    const inl = pts.filter((p) => Math.abs((p[0] - a[0]) * nx + (p[1] - a[1]) * ny) < 1.2);
-    if (!best || inl.length > best.length) best = inl;
+  let best = null, bestCost = Infinity;
+  // перебор всех пар: детерминированно (случайные пары давали разные результаты от запуска к запуску) и недорого
+  for (let i = 0; i < n; i++) {
+    for (let j = i + 1; j < n; j++) {
+      const a = pts[i], b = pts[j];
+      const dx = b[0] - a[0], dy = b[1] - a[1], L = Math.hypot(dx, dy);
+      if (L < 5) continue;
+      const nx = -dy / L, ny = dx / L;
+      const inl = [];
+      let cost = 0;
+      for (const p of pts) {
+        const d = Math.abs((p[0] - a[0]) * nx + (p[1] - a[1]) * ny);
+        if (d < 1.2) { inl.push(p); cost += d; }
+      }
+      if (!best || inl.length > best.length || (inl.length === best.length && cost < bestCost)) { best = inl; bestCost = cost; }
+    }
   }
   return best && best.length >= CFG.edgeMinInliers ? best : null;
 }
 
 /** Поиск краёв холста вокруг позы Hm. Возвращает наблюдения { j, pts } для надёжных сторон. */
-function edgeObservations(Hm, radius) {
+function edgeObservations(Hm, radius, only, strictDir) {
   const out = [];
   if (!st.edges) return out;
   const q = mapQuad(Hm, st.quad);
   const S = CFG.edgeSamples;
   for (let j = 0; j < 4; j++) {
+    if (only && !only.includes(j)) continue;
     const e = st.edges[j];
     if (!e.use) continue;
     const { A, B, len, nx, ny } = edgeGeom(q, j);
     if (len < 20) continue;
     const minD = Math.max(5, e.contrast * 0.3);
+    const tolIn = Math.max(38, 3 * e.sdIn), tolOut = Math.max(50, 3 * e.sdOut);
     const pts = [];
     for (let k = 0; k < S; k++) {
       const s = 0.06 + 0.88 * k / (S - 1);
@@ -820,6 +1000,14 @@ function edgeObservations(Hm, radius) {
         if (score > best) { best = score; bt = t; bd = d; }
       }
       if (best === -Infinity) continue;
+      // внутри — цвет бумаги, снаружи — цвет фона; иначе это край чего-то постороннего (пальцы, карандаш)
+      {
+        const ex = px + nx * bt, ey = py + ny * bt;
+        const ci = rgbAt(ex - nx * 7, ey - ny * 7), co = rgbAt(ex + nx * 7, ey + ny * 7);
+        if (st.skinOn && st.skin && (onSkin(st.skin, ex - nx * 7, ey - ny * 7) || (!e.bgSkin && onSkin(st.skin, ex + nx * 7, ey + ny * 7)))) continue; // контур пальцев
+        if (!ci || colorDist(ci, e.inC) > tolIn) continue;
+        if (e.useOut && (!co || colorDist(co, e.outC) > tolOut)) continue;
+      }
       // субпиксель: парабола по соседям
       const i = bt + radius;
       const l = prof[i - 1], r = prof[i + 1];
@@ -831,7 +1019,13 @@ function edgeObservations(Hm, radius) {
       pts.push([px + nx * (bt + off), py + ny * (bt + off)]);
     }
     const inl = fitLine(pts);
-    if (inl && inl.length >= S * 0.35) out.push({ j, pts: inl });
+    if (inl && inl.length >= (strictDir ? Math.max(6, S * 0.22) : S * 0.35)) {
+      if (strictDir) { // широкий поиск (перезахват грани): направление должно совпасть с предсказанным
+        const l = fitPts(inl), ux = (B[0] - A[0]) / len, uy = (B[1] - A[1]) / len;
+        if (!l || Math.abs(l.ux * uy - l.uy * ux) > 0.1) continue;
+      }
+      out.push({ j, pts: inl });
+    }
   }
   return out;
 }
@@ -963,6 +1157,7 @@ function startTracking(quad, msg) {
     quad,
     searchQuad: expandQuad(quad, msg.margin ?? CFG.margin),
     fullFrame: !!msg.fullFrame,
+    anchors: [],
     H: I3(),
     prevH: null,
     cur: new Float32Array(0),
@@ -981,10 +1176,31 @@ function startTracking(quad, msg) {
     ancLow: 0,
     Hgood: null,
   };
+  // маска кожи включается, только если внутри рамки кожи нет (на ладони цель — сама кожа)
+  {
+    const sm = computeSkin(), inner = polyMask(quad);
+    const total = cv.countNonZero(inner);
+    cv.bitwise_and(sm, inner, sm);
+    st.skinOn = total > 0 && cv.countNonZero(sm) / total < 0.15;
+    sm.delete(); inner.delete();
+    st.skin = st.skinOn ? computeSkin() : null;
+  }
   learnEdges();
   seedPoints(st.H, false);
+  // у пустой бумаги своих признаков почти нет — держимся за окружение (статичные предметы вокруг)
+  if (!st.fullFrame && !msg.noAuto && st.cur.length / 2 < CFG.autoEnvPts) {
+    const own = [st.cur, st.ref];
+    st.fullFrame = true; st.auto = true;
+    seedPoints(st.H, false);
+    // окружение берём, только если оно заметно богаче собственных признаков листа (у гладкого фона точек тоже нет)
+    if (st.cur.length / 2 < Math.max(CFG.autoEnvPts * 0.8, own[0].length / 2 * 2)) {
+      st.fullFrame = false; st.auto = false;
+      st.cur = own[0]; st.ref = own[1];
+    }
+  }
   st.initialPts = st.cur.length / 2;
   setTemplate(gray, null);
+  st.eccOk = st.tmpl.ecc.texStd >= ECC.minTex; // текстура считается один раз — по эталонному кадру (позже в заплатку может попасть рука)
   st.keyframes.push(makeKeyframe(gray, st.H, now()));
   updateRecentEcc();
   norm.copyTo(prevNorm);
@@ -998,6 +1214,7 @@ function startTracking(quad, msg) {
     edges: goodEdges,
     weak: st.tmpl.n < 15 && goodEdges < 3,
     eccStd: +st.tmpl.ecc.texStd.toFixed(1),
+    auto: !!st.auto,
   };
 }
 
@@ -1012,6 +1229,7 @@ function track(msg) {
   loadFrame(msg);
   normalize(gray, norm);
   st.frame++;
+  if (st.skinOn) { if (st.skin) st.skin.delete(); st.skin = computeSkin(); }
   lap('prep');
 
   const Hprev = st.H;
@@ -1033,7 +1251,7 @@ function track(msg) {
 
   // релокализация: при потере — по всему кадру; периодически — проверка дрейфа
   let reloc = null;
-  if (wasLost || st.frame - st.lastReloc >= CFG.relocEvery) {
+  if (wasLost || st.frame - st.lastReloc >= (st.fullFrame ? CFG.relocEnv : CFG.relocEvery)) {
     st.lastReloc = st.frame;
     reloc = relocalize(gray, wasLost ? null : pred);
     if (reloc) {
@@ -1050,7 +1268,7 @@ function track(msg) {
   // плотное выравнивание: сначала по «свежей» заплатке (держит при смене вида), затем по якорной
   // (первый кадр — без дрейфа). Нужно, когда точек потока мало (кожа, бумага) или поза потеряна.
   let ecc = null;
-  if (st.tmpl && st.tmpl.ecc && st.tmpl.ecc.texStd >= ECC.minTex && (wasLost || st.lowTex || st.cur.length / 2 < CFG.eccSparse || st.frame % CFG.eccEvery === 0)) {
+  if (st.tmpl && st.tmpl.ecc && st.eccOk && (wasLost || st.lowTex || st.cur.length / 2 < CFG.eccSparse || st.frame % CFG.eccEvery === 0)) {
     const sane = (r) => r && plausible(r.H) && shapeOk(r.H) && quadDist(r.H, pred) < Math.max(W, H) * 0.15;
     const coarse = wasLost || st.fail > 0;
     // «свежая» заплатка сама по себе может зацепиться за фон: без подтверждения якорем верим ей, только если
@@ -1087,8 +1305,14 @@ function track(msg) {
   lap('ecc');
 
   // измерения без дрейфа
-  const pairs = templatePairs(pred);
-  st.lowTex = pairs.n < 60; // мало опорных точек: кожа, пустая бумага — тогда выравниваем по заплатке каждый кадр
+  // Сравнение с шаблоном — самая дорогая часть кадра. На медленном устройстве, когда поток уверенно держит позу
+  // (богатая фактура), делаем его не на каждом кадре.
+  const lite = !!st.lite;
+  const skipTmpl = lite && source === 'lk' && lkInl >= 30 && !wasLost && !st.fail && !st.lowTex &&
+    !ecc && st.frame % 3 !== 0;
+  const pairs = skipTmpl ? { ref: [], cur: [], n: 0, ratio: 0, skipped: true } : templatePairs(pred);
+  if (!skipTmpl) st.lowTex = pairs.n < 60;
+  if (false) st.lowTex = false; // мало опорных точек: кожа, пустая бумага — тогда выравниваем по заплатке каждый кадр
   if (ecc) { // сетка точек по рамке, перенесённая по ECC-позе, — плотная опора для оптимизации
     const q = st.quad, G = 5;
     for (let i = 0; i < G; i++) for (let j = 0; j < G; j++) {
@@ -1101,15 +1325,51 @@ function track(msg) {
   }
   lap('tmpl');
   const motion = quadDist(pred, Hprev);
-  const radius = Math.round(Math.min(24, CFG.edgeRadius + (source === 'lk' ? 0 : motion * 0.5) + (wasLost ? 6 : 0)));
-  const edges = edgeObservations(pred, radius);
+  let radius = Math.round(Math.min(24, CFG.edgeRadius + (source === 'lk' ? 0 : motion * 0.5) + (wasLost ? 6 : 0)));
+  // Когда поза по потоку надёжна, настоящий край должен лежать почти там, где предсказано. Узкое окно не даёт
+  // позе «ползти» к ложному краю (контур пальцев поверх страницы, карандаш), пока настоящий закрыт рукой.
+  const confident = source === 'lk' && lkInl >= 12;
+  if (confident) radius = Math.min(radius, CFG.edgeGate + 2);
+  let edges = edgeObservations(pred, radius);
+  if ((st.auto || st.anchors.length) && source === 'lk' && edges.length >= 2) {
+    // Режим «окружение» и точки опоры верны, пока лист неподвижен относительно фона. Если края листа (проверены по цвету)
+    // стабильно лежат не там, где даёт фон, — лист двигают отдельно от окружения: переходим на свои точки и края.
+    const qd = mapQuad(pred, st.quad), res = [];
+    for (const e of edges) {
+      const g = edgeGeom(qd, e.j);
+      const ds = e.pts.map((p) => Math.abs((p[0] - g.A[0]) * g.nx + (p[1] - g.A[1]) * g.ny)).sort((a, b) => a - b);
+      res.push(ds[ds.length >> 1]);
+    }
+    res.sort((a, b) => a - b);
+    // авто-окружение сбрасываем быстро; точки опоры выбрал сам пользователь — им доверяем дольше (рука/листание искажают края)
+    const lim = st.auto ? CFG.envEdgeErr : 2 * CFG.envEdgeErr, need = st.auto ? 3 : 12;
+    st.envBad = res[res.length >> 1] > lim ? (st.envBad || 0) + 1 : 0;
+    if (st.envBad >= need) {
+      if (st.auto) { st.auto = false; st.fullFrame = false; st.autoDropped = true; }
+      if (st.anchors.length) { st.anchors = []; st.anchorsDropped = true; }
+      st.envBad = 0;
+      st.cur = new Float32Array(0); st.ref = new Float32Array(0);
+    }
+  }
+  if (st.edges) {
+    // грань, которую давно не видно (закрыта рукой), ищем заново широко; цвета и направление защищают от ложных краёв
+    const seen = new Set(edges.map((e) => e.j));
+    st.edgeMiss = st.edgeMiss || [0, 0, 0, 0];
+    const lostSides = [];
+    for (let j = 0; j < 4; j++) {
+      if (!st.edges[j].use) continue;
+      st.edgeMiss[j] = seen.has(j) ? 0 : st.edgeMiss[j] + 1;
+      if (st.edgeMiss[j] >= 4 && st.edgeMiss[j] % 2 === 0) lostSides.push(j);
+    }
+    if (lostSides.length && !wasLost) edges = edges.concat(edgeObservations(pred, 48, lostSides, true));
+  }
   lap('edges');
 
   // достаточно ли измерений, чтобы доверять позе
   const nEdges = edges.length;
   // точки шаблона засчитываются, только если совпала заметная их доля (иначе это шум)
   const tmplOk = pairs.n >= CFG.minRefine && (pairs.ratio >= 0.12 || pairs.n >= 30);
-  const good = tmplOk || !!ecc || nEdges >= 3 || (nEdges >= 2 && pairs.n >= 4) ||
+  const good = tmplOk || !!ecc || skipTmpl || nEdges >= 3 || (nEdges >= 2 && pairs.n >= 4) ||
     (!wasLost && lkInl >= 15 && pairs.n >= 4);
   let state = 'lost', rms = 0, accepted = null;
   if (good) {
@@ -1141,9 +1401,11 @@ function track(msg) {
       reanchor(st.H);
       if (st.cur.length / 2 < Math.max(CFG.minCorners, st.initialPts * 0.35)) seedPoints(st.H, true);
     }
+    // опорные точки не должны «слипаться» в одном углу кадра: периодически доливаем в пустые ячейки сетки
+    if (st.frame % 10 === 0 && (st.cur.length / 2 < CFG.maxCorners - 15 || st.anchors.length) && !st.fail) seedPoints(st.H, true);
     // рисунок заметно изменился — обновляем шаблон
-    st.tmpl.low = st.tmpl.n >= 8 && pairs.ratio < 0.4 ? st.tmpl.low + 1 : 0;
-    if (st.tmpl.low > 20 && st.stable > 5 && !st.fail) updateTemplate();
+    if (!pairs.skipped) st.tmpl.low = st.tmpl.n >= 8 && pairs.ratio < 0.4 ? st.tmpl.low + 1 : 0;
+    if (st.tmpl.low > 20 && st.stable > 5 && !st.fail && !st.auto) updateTemplate(); // у пустой бумаги шаблон не переучиваем: туда попадает рука
     if (st.tmpl && st.tmpl.ecc && !st.fail && st.frame % ECC.recentEvery === 0) updateRecentEcc(); // не запоминаем позу «по инерции»
     // новый ключевой кадр: позиция стабильна и недавно подтверждена ORB
     const t = now();
@@ -1163,7 +1425,11 @@ function track(msg) {
   lap('upkeep');
 
   const tmp = prevNorm; prevNorm = norm; norm = tmp;
+  const anchorsDropped = st.anchorsDropped;
+  st.anchorsDropped = false;
   while (self.DEBUG_MIN_MS && now() - tStart < self.DEBUG_MIN_MS) { /* тесты: имитация медленного устройства */ }
+  st.ems = st.ems === undefined ? now() - tStart : st.ems * 0.95 + (now() - tStart) * 0.05; // скользящее среднее времени кадра
+  if (st.ems > CFG.liteMs) st.lite = true; else if (st.ems < CFG.liteMs * 0.75) st.lite = false;
   return {
     type: 'pose',
     state,
@@ -1178,7 +1444,41 @@ function track(msg) {
     source,
     ms: Math.round(now() - tStart),
     prof,
+    dbgPts: self.DEBUG_PTS ? Array.from(st.cur) : undefined,
+    anchors: st.anchors.length ? anchorPositions() : undefined,
+    anchorsDropped: anchorsDropped || undefined,
+    dbgEnv: [st.auto ? 1 : 0, st.envBad || 0, st.autoDropped ? 1 : 0, st.fullFrame ? 1 : 0],
   };
+}
+
+// ---------- замер скорости устройства ----------
+let benchMs = 0;
+/**
+ * Короткий замер на синтетическом кадре 640×360: нормализация, поиск признаков, поток, разворот — то же, что делает
+ * трекинг каждый кадр. Возвращает медиану времени одного прохода (мс). Приложение по ней выбирает размер кадра анализа.
+ */
+function benchmark() {
+  const w = 640, h = 360;
+  const a = new cv.Mat(h, w, cv.CV_8UC1), b = new cv.Mat(), t = new cv.Mat();
+  let seed = 12345;
+  for (let i = 0; i < a.data.length; i++) { seed = (seed * 1103515245 + 12345) & 0x7fffffff; a.data[i] = (seed >> 16) & 255; }
+  cv.GaussianBlur(a, a, new cv.Size(5, 5), 0);
+  const M = cv.matFromArray(2, 3, cv.CV_64F, [1, 0, 2, 0, 1, 1]);
+  cv.warpAffine(a, b, M, new cv.Size(w, h));
+  const times = [];
+  for (let k = 0; k < 5; k++) {
+    const t0 = now();
+    const c = new cv.Mat(), p1 = new cv.Mat(), s = new cv.Mat(), e = new cv.Mat();
+    cv.GaussianBlur(a, t, new cv.Size(15, 15), 0);
+    cv.goodFeaturesToTrack(a, c, 120, 0.01, 8);
+    if (c.rows) cv.calcOpticalFlowPyrLK(a, b, c, p1, s, e, new cv.Size(21, 21), 3);
+    cv.warpAffine(a, t, M, new cv.Size(w, h));
+    [c, p1, s, e].forEach((m) => m.delete());
+    if (k > 0) times.push(now() - t0); // первый проход — прогрев
+  }
+  [a, b, t, M].forEach((m) => m.delete());
+  times.sort((x, y) => x - y);
+  return +times[times.length >> 1].toFixed(1);
 }
 
 // ---------- автопоиск холста ----------
@@ -1725,18 +2025,22 @@ self.onmessage = async (e) => {
         orb = new cv.ORB(CFG.orbFeatures);
         matcher = new cv.BFMatcher(cv.NORM_HAMMING, false);
         ready = true;
+        benchMs = benchmark();
       }
-      postMessage({ type: 'ready', id: msg.id, bitmap: typeof OffscreenCanvas !== 'undefined' });
+      postMessage({ type: 'ready', id: msg.id, bitmap: typeof OffscreenCanvas !== 'undefined', bench: benchMs });
       return;
     }
     if (!ready) throw new Error('OpenCV ещё не загружен');
     let res;
     if (msg.type === 'lock') res = lock(msg);
     else if (msg.type === 'frame') res = sel ? selFrame(msg) : track(msg);
+    else if (msg.type === 'debugPts') { self.DEBUG_PTS = true; res = { type: 'ok' }; }
     else if (msg.type === 'debugMinMs') { self.DEBUG_MIN_MS = msg.ms; res = { type: 'ok' }; }
     else if (msg.type === 'selStart') res = selStart(msg);
     else if (msg.type === 'selTap') res = selTap(msg);
     else if (msg.type === 'selBack') res = selBack();
+    else if (msg.type === 'addAnchor') res = addAnchor(msg);
+    else if (msg.type === 'removeAnchor') res = removeAnchor(msg);
     else if (msg.type === 'detect') res = detect(msg);
     else if (msg.type === 'setQuad') {
       // пользователь поправил рамку холста во время трекинга (в опорных координатах)
