@@ -539,7 +539,7 @@ function frame(t) {
   // статистика
   if (S.stats && ar.mode === 'tracking' && ar.info) {
     const i = ar.info;
-    $('#stats').textContent = `${tracker.stats.fps} к/с · ${i.ms} мс · точек ${i.points} · inl ${i.inliers} · kf ${i.keyframes} · ${i.source}${sync.active ? ' · показ с задержкой ' + Math.round(sync.delay) + ' мс, кадр ' + sync.bw + '×' + sync.bh + ' (' + sync.grabMs.toFixed(0) + '+' + sync.drawMs.toFixed(0) + ' мс)' : ''} · анализ ${tracker.procMax}px`;
+    $('#stats').textContent = `${tracker.stats.fps} к/с · ${i.ms} мс · точек ${i.points} · inl ${i.inliers} · kf ${i.keyframes} · ${i.source}${sync.active ? ' · показ с задержкой ' + Math.round(sync.delay) + ' мс, кадр ' + sync.bw + '×' + sync.bh + ' (' + sync.grabMs.toFixed(0) + '+' + sync.drawMs.toFixed(0) + ' мс), экстрапол. ' + sync.extrap + '/' + sync.draws : ''} · анализ ${tracker.procMax}px`;
   } else $('#stats').textContent = '';
 
   // таймер записи

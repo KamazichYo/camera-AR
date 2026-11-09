@@ -1446,7 +1446,14 @@ function track(msg) {
   }
   lap('opt');
 
-  if (state === 'tracking') {
+  // Обслуживание (досев точек, шаблон, ключевые кадры) на позу этого кадра не влияет, но может занимать десятки мс.
+  // Поэтому поза отправляется первой, а обслуживание идёт сразу после отправки (в тот же воркер, до следующего кадра):
+  // иначе каждый «тяжёлый» кадр приходил бы на экран с опозданием и референс на миг «выстреливал».
+  const finishEms = () => { // скользящее среднее полного времени кадра (вместе с обслуживанием) — для облегчённого режима
+    st.ems = st.ems === undefined ? now() - tStart : st.ems * 0.95 + (now() - tStart) * 0.05;
+    if (st.ems > CFG.liteMs) st.lite = true; else if (st.ems < CFG.liteMs * 0.75) st.lite = false;
+  };
+  const upkeep = () => {
     const jump = quadDist(st.H, Hprev);
     st.stable = jump < 1.5 ? st.stable + 1 : 0;
     if (wasLost || !st.cur.length) seedPoints(st.H, false);
@@ -1475,20 +1482,26 @@ function track(msg) {
         if (st.keyframes.length > CFG.maxKeyframes) st.keyframes.splice(1, 1)[0].desc.delete(); // исходный храним всегда
       } else kf.desc.delete();
     }
-  } else {
+    const tmp = prevNorm; prevNorm = norm; norm = tmp;
+    finishEms();
+  };
+  let defer = null;
+  if (state === 'tracking') defer = upkeep;
+  else {
     st.lost++;
     st.stable = 0;
     st.cur = new Float32Array(0); st.ref = new Float32Array(0);
+    const tmp = prevNorm; prevNorm = norm; norm = tmp;
   }
+  if (!defer) finishEms();
+  if (defer && self.DEBUG_NO_DEFER) { defer(); defer = null; }
   lap('upkeep');
 
-  const tmp = prevNorm; prevNorm = norm; norm = tmp;
   const anchorsDropped = st.anchorsDropped;
   st.anchorsDropped = false;
-  while (self.DEBUG_MIN_MS && now() - tStart < self.DEBUG_MIN_MS) { /* тесты: имитация медленного устройства */ }
-  st.ems = st.ems === undefined ? now() - tStart : st.ems * 0.95 + (now() - tStart) * 0.05; // скользящее среднее времени кадра
-  if (st.ems > CFG.liteMs) st.lite = true; else if (st.ems < CFG.liteMs * 0.75) st.lite = false;
-  return {
+  const dbgMin = (self.DEBUG_MIN_MS || 0) + (self.DEBUG_JITTER_MS ? Math.random() * self.DEBUG_JITTER_MS : 0);
+  while (dbgMin && now() - tStart < dbgMin) { /* тесты: имитация медленного устройства */ }
+  const out = {
     type: 'pose',
     state,
     H: outH(st.H),
@@ -1507,6 +1520,8 @@ function track(msg) {
     anchorsDropped: anchorsDropped || undefined,
     dbgEnv: [st.auto ? 1 : 0, st.envBad || 0, st.autoDropped ? 1 : 0, st.fullFrame ? 1 : 0],
   };
+  if (defer) Object.defineProperty(out, 'defer', { value: defer, enumerable: false });
+  return out;
 }
 
 // ---------- замер скорости устройства ----------
@@ -2094,6 +2109,7 @@ self.onmessage = async (e) => {
     else if (msg.type === 'frame') res = sel ? selFrame(msg) : track(msg);
     else if (msg.type === 'debugPts') { self.DEBUG_PTS = true; res = { type: 'ok' }; }
     else if (msg.type === 'debugMinMs') { self.DEBUG_MIN_MS = msg.ms; res = { type: 'ok' }; }
+    else if (msg.type === 'debugJitterMs') { self.DEBUG_JITTER_MS = msg.ms; res = { type: 'ok' }; }
     else if (msg.type === 'selStart') res = selStart(msg);
     else if (msg.type === 'selTap') res = selTap(msg);
     else if (msg.type === 'selBack') res = selBack();
@@ -2107,7 +2123,10 @@ self.onmessage = async (e) => {
     } else if (msg.type === 'unlock') {
       dropState(); st = null; sel = null; res = { type: 'unlocked' };
     }
-    if (res) postMessage({ ...res, id: msg.id });
+    if (res) {
+      postMessage({ ...res, id: msg.id });
+      if (res.defer) res.defer(); // обслуживание после отправки позы (см. track)
+    }
   } catch (err) {
     if (msg.bmp && msg.bmp.close) msg.bmp.close();
     let message = String((err && err.message) || err);

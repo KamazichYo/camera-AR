@@ -15,7 +15,8 @@ import { applyQuad } from './geometry.js';
 
 const MAX_RING = 24;      // кадров в буфере (≈ 0,8 с)
 const MAX_POSES = 40;
-const MAX_EXTRAP = 120;   // мс: дальше последней позы экстраполируем не больше (при простое трекера)
+const MAX_EXTRAP = 70;    // мс: дальше последней позы экстраполируем не больше (при простое трекера)
+const EXTRAP_GAIN = 0.7;  // и не на всю скорость: рывок камеры обычно сменяется торможением, полная скорость «выстреливает»
 const WIDTHS = [1280, 960, 720, 540]; // ширина кадра показа; на слабом телефоне идём вниз по лесенке
 const GRAB_SLOW_MS = 22;  // createImageBitmap дольше этого (в среднем) — телефон не успевает: уменьшаем кадр
 const DRAW_SLOW_MS = 9;   // отрисовка кадра в canvas дольше этого — то же
@@ -33,6 +34,14 @@ export class SyncView {
     this.target = 90;
     this.latency = 40;    // EMA: от показа кадра до прихода его позы
     this.period = 40;     // EMA: интервал между позами
+    this.fp = 0;          // период кадров камеры (мс), 0 — ещё не оценён
+    this.ft0 = 0;         // фаза сетки кадров камеры
+    this.latHist = [];    // последние задержки трекера и интервалы между позами — для высокого перцентиля
+    this.perHist = [];
+    this.extrap = 0;      // сколько раз референс пришлось экстраполировать (поза не успела) — диагностика
+    this.draws = 0;
+    this.latDev = 10;     // EMA: разброс задержки трекера (среднее модуля отклонения)
+    this.perDev = 10;     // EMA: разброс интервала между позами
     this.shown = null;    // кадр, нарисованный в canvas
     this.minDelay = 30;
     this.maxDelay = 320;
@@ -66,11 +75,11 @@ export class SyncView {
     this._setWidth(WIDTHS[this.level]);
     this.active = true;
     this.ring = []; this.poses = []; this.shown = null; this.nPoses = 0;
-    this.delay = this.target = 90; this.latency = 40; this.period = 40;
+    this.delay = this.target = 90; this.latency = 40; this.period = 40; this.latDev = 10; this.perDev = 10; this.fp = 0; this.latHist = []; this.perHist = []; this.extrap = 0; this.draws = 0;
     const gen = ++this.gen;
     const cb = (now, md) => {
       if (!this.active || gen !== this.gen) return;
-      this._grab((md && md.presentationTime) || now);
+      this._grab(this._regUpdate((md && md.presentationTime) || now));
       this.video.requestVideoFrameCallback(cb);
     };
     this.video.requestVideoFrameCallback(cb);
@@ -84,9 +93,35 @@ export class SyncView {
     this.ring = []; this.poses = []; this.shown = null;
   }
 
+  /**
+   * Метки времени кадров камеры дрожат на несколько мс (особенно на телефонах). Выбор кадра «последний, чья метка не позже
+   * момента показа» из-за этого иногда держит кадр 1, а иногда 3 отрисовки подряд — картинка идёт рывками. Поэтому метки
+   * приводятся к ровной сетке (период и фаза оцениваются на лету); если кадры идут нерегулярно — метка остаётся как есть.
+   */
+  _regUpdate(T) {
+    if (!this.fpLast) { this.fpLast = T; return T; }
+    const dt = T - this.fpLast;
+    this.fpLast = T;
+    if (dt < 8 || dt > 90) { this.fp = 0; return T; }          // пауза/смена частоты — оценка заново
+    if (!this.fp) { this.fp = dt; this.ft0 = T; return T; }
+    const n = Math.max(1, Math.round(dt / this.fp));
+    const per = dt / n;
+    if (Math.abs(per - this.fp) < 0.25 * this.fp) this.fp += 0.04 * (per - this.fp);
+    return this._reg(T, true);
+  }
+
+  _reg(T, learn = false) {
+    if (!this.fp) return T;
+    const k = Math.round((T - this.ft0) / this.fp);
+    const g = this.ft0 + k * this.fp, r = T - g;
+    if (Math.abs(r) > 0.3 * this.fp) { if (learn) this.ft0 = T; return T; } // кадр не на сетке — не трогаем
+    if (learn) this.ft0 += 0.08 * r; // фаза плавно следует за камерой
+    return g;
+  }
+
   async _grab(T) {
     // не копим очередь снимков: на слабом телефоне она растёт быстрее, чем разбирается
-    if (this.inflight >= 2) return;
+    if (this.inflight >= 5) return;
     this.inflight++;
     const t0 = performance.now();
     let bmp;
@@ -115,19 +150,33 @@ export class SyncView {
   /** Поза кадра, показанного в момент T (H — в координатах видео). */
   addPose(T, H) {
     const now = performance.now();
+    T = this._reg(T);
     const poses = this.poses;
     if (poses.length) {
       const dt = T - poses[poses.length - 1].T;
       if (dt <= 0) return;
-      this.period += 0.1 * (Math.min(dt, 250) - this.period);
+      const dtc = Math.min(dt, 250);
+      this.perDev += 0.1 * (Math.abs(dtc - this.period) - this.perDev);
+      this.period += 0.1 * (dtc - this.period);
     }
-    this.latency += 0.1 * (Math.max(0, now - T) - this.latency);
+    const lat = Math.max(0, now - T);
+    this.latDev += 0.1 * (Math.abs(lat - this.latency) - this.latDev);
+    this.latency += 0.1 * (lat - this.latency);
     poses.push({ T, H });
     if (poses.length > MAX_POSES) poses.shift();
-    // нужна задержка не меньше «задержка трекера + период между позами»
-    this.target = Math.min(this.maxDelay, Math.max(this.minDelay, this.latency + this.period + 6));
-    // первые позы: задержка выставляется сразу (одноразовый скачок при включении AR), дальше — плавно
-    if (++this.nPoses <= 6) this.delay = this.target;
+    // нужна задержка не меньше «задержка трекера + период между позами» плюс запас на их разброс (иначе поза
+    // иногда опаздывает и референс экстраполируется) и на снимок кадра (иначе кадр не успевает попасть в буфер)
+    // Берём высокий перцентиль, а не среднее: поза «с плюсом» (шаг ECC, перезахват ORB, сборка мусора) приходит позже
+    // обычного, и если задержки не хватило, референс на эти кадры экстраполируется и на 3–4 отрисовки «выстреливает».
+    const lh = this.latHist, ph = this.perHist;
+    // первые позы (прогрев воркера, первая позиция) в статистику не берём: одна долгая поза иначе задрала бы задержку на долго
+    if (this.nPoses >= 3) { lh.push(lat); if (lh.length > 60) lh.shift(); }
+    if (this.diag) (this.latAll || (this.latAll = [])).push(Math.round(lat)); // только для тестов
+    if (this.nPoses >= 3 && poses.length > 1) { ph.push(Math.min(T - poses[poses.length - 2].T, 250)); if (ph.length > 60) ph.shift(); }
+    const pct = (arr, f) => { if (!arr.length) return 0; const a = arr.slice().sort((x, y) => x - y); return a[Math.min(a.length - 1, Math.floor(a.length * f))]; };
+    const need = Math.max(this.latency + 1.5 * this.latDev + this.period + this.perDev, lh.length >= 15 ? pct(lh, 0.95) + pct(ph, 0.9) : 0) + 6;
+    this.target = Math.min(this.maxDelay, Math.max(this.minDelay, need, 2 * this.grabMs + 30));
+    this.nPoses++;
   }
 
   /**
@@ -157,11 +206,12 @@ export class SyncView {
     const last = poses[poses.length - 1];
     if (T >= last.T) {
       // позы ещё нет — продолжаем по скорости последних двух (недолго)
+      this.extrap++;
       const qa = q(last);
       if (poses.length < 2) return qa;
       const prev = poses[poses.length - 2], qb = q(prev);
       const dt = last.T - prev.T;
-      const lead = Math.min(MAX_EXTRAP, T - last.T);
+      const lead = Math.min(MAX_EXTRAP, T - last.T) * EXTRAP_GAIN;
       return qa.map((p, i) => [p[0] + (p[0] - qb[i][0]) / dt * lead, p[1] + (p[1] - qb[i][1]) / dt * lead]);
     }
     let i = poses.length - 1;
@@ -169,7 +219,26 @@ export class SyncView {
     const a = poses[i - 1], b = poses[i];
     const k = (T - a.T) / (b.T - a.T);
     const qa = q(a), qb = q(b);
-    return qa.map((p, j) => [p[0] + (qb[j][0] - p[0]) * k, p[1] + (qb[j][1] - p[1]) * k]);
+    // Кубический Эрмит по соседним позам: между редкими позами (слабый телефон, 8–10 к/с) рука движется по кривой, а
+    // линейная интерполяция даёт «ломаную» — референс отстаёт от холста посреди интервала и догоняет к следующей позе.
+    const h = b.T - a.T;
+    const pa = i >= 2 ? poses[i - 2] : null, pb = i + 1 < poses.length ? poses[i + 1] : null;
+    const qpa = pa ? q(pa) : null, qpb = pb ? q(pb) : null;
+    const k2 = k * k, k3 = k2 * k;
+    const h00 = 2 * k3 - 3 * k2 + 1, h10 = k3 - 2 * k2 + k, h01 = -2 * k3 + 3 * k2, h11 = k3 - k2;
+    return qa.map((p, j) => {
+      const out = [0, 0];
+      for (let c = 0; c < 2; c++) {
+        const slope = (qb[j][c] - p[c]) / h;
+        // касательные: по соседям (центральная разность), на краю — по самому интервалу
+        const ma = qpa ? (qb[j][c] - qpa[j][c]) / (b.T - pa.T) : slope;
+        const mb = qpb ? (qpb[j][c] - p[c]) / (pb.T - a.T) : slope;
+        // не даём касательной уйти против движения на интервале (иначе петли от шума)
+        const ca = ma * slope < 0 ? 0 : ma, cb = mb * slope < 0 ? 0 : mb;
+        out[c] = h00 * p[c] + h10 * h * ca + h01 * qb[j][c] + h11 * h * cb;
+      }
+      return out;
+    });
   }
 
   /**
@@ -178,10 +247,14 @@ export class SyncView {
    */
   frame(now) {
     if (!this.active || !this.ring.length) return null;
-    // плавная подстройка задержки (резкая смена задержки выглядела бы как ускорение/замедление картинки)
-    // вверх быстрее (иначе не хватает поз), вниз медленнее
+    this.draws++;
+    // Задержка почти постоянна: любое её изменение — это ускорение/замедление картинки (рывок). Поэтому растёт только
+    // когда не хватает (быстро, иначе не хватает поз), а убывает лишь когда запас стал большим (30 мс) — и очень медленно.
     const d = this.target - this.delay;
-    this.delay += Math.max(-0.4, Math.min(1.2, d));
+    // (в первые секунды после включения — быстрее, но всё равно медленнее хода времени: скачок задержки назад показал бы
+    // прежний кадр, то есть картинка дёрнулась бы вспять)
+    if (d > 0) this.delay += Math.min(this.nPoses <= 15 ? 8 : 1.2, d);
+    else if (d < -30) this.delay -= Math.min(0.3, Math.max(0.1, (-d - 30) * 0.01)); // 0,1–0,3 мс за отрисовку: ≤ 2% скорости картинки
     const Td = now - this.delay;
     let f = null;
     for (const r of this.ring) { if (r.T <= Td) f = r; else break; }
