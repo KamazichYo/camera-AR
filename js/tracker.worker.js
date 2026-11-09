@@ -36,9 +36,12 @@ const CFG = {
   wPersp: 0.6,            // вес штрафа за перспективу в оптимизаторе
   coastMax: 8,            // сколько кадров подряд ехать по инерции при сбое, прежде чем объявить потерю
   edgeGate: 100,            // px: когда поза по потоку надёжна, край ищется только в такой окрестности предсказания
-  eccVsLk: 5,             // px: допустимое расхождение ECC с уверенной позой по потоку (на видимой части холста)
+  eccVsLk: 5,              // px: допустимое расхождение ECC с уверенной позой по потоку (на видимой части холста)
   envEdgeErr: 4.5,        // px: края листа стабильно дальше этого от позы по фону — лист двигают отдельно от окружения
   liteMs: 55,             // среднее время кадра выше этого (слабый телефон) — включается облегчённый режим (ниже 0.75× — выключается)
+  perspDev: 5,            // px: гомография по опорам отличается от аффинной больше этого — перспектива «чужая», берём аффинную
+  ownMin: 20,             // столько своих точек холста — поза (гомография) по ним одним, без опор/окружения из других плоскостей
+  ownFew: 6,              // от стольких своих точек — аффинная модель по ним (меньше — ведут опоры/окружение, тоже аффинно)
   anchorPts: 14,          // сколько точек потока держим в каждой опорной области
   anchorR: 34,            // px (кадра анализа): радиус опорной области
   autoEnvPts: 30,        // меньше стольких собственных точек у холста (пустая бумага) — окружение подключается само
@@ -379,6 +382,33 @@ function orbDetect(img, mask) {
   return { desc, pts, n };
 }
 
+function pointInPoly(x, y, q) {
+  let inside = false;
+  for (let i = 0, j = q.length - 1; i < q.length; j = i++) {
+    if ((q[i][1] > y) !== (q[j][1] > y) && x < (q[j][0] - q[i][0]) * (y - q[i][1]) / (q[j][1] - q[i][1]) + q[i][0]) inside = !inside;
+  }
+  return inside;
+}
+
+/** Аффинная модель (6 степеней свободы) по RANSAC: устойчивее гомографии, когда точек мало или они не в одной плоскости. */
+function findAffine(src, dst, thr) {
+  const n = src.length / 2;
+  if (n < 3) return null;
+  const s = cv.matFromArray(n, 1, cv.CV_32FC2, src);
+  const d = cv.matFromArray(n, 1, cv.CV_32FC2, dst);
+  const mask = new cv.Mat();
+  const A = cv.estimateAffine2D(s, d, mask, cv.RANSAC, thr, 2000, 0.99, 10);
+  let res = null;
+  if (!A.empty()) {
+    const a = Array.from(A.data64F);
+    let count = 0;
+    for (let i = 0; i < n; i++) if (mask.data[i]) count++;
+    res = { H: [a[0], a[1], a[2], a[3], a[4], a[5], 0, 0, 1], inliers: count, mask: Uint8Array.from(mask.data) };
+  }
+  s.delete(); d.delete(); mask.delete(); A.delete();
+  return res;
+}
+
 function findH(src, dst, thr, iters = 2000) {
   const n = src.length / 2;
   if (n < 4) return null;
@@ -553,17 +583,47 @@ function trackLK() {
     idx = ki; out = ko;
   }
   if (idx.length < CFG.minInliersLK) return null;
-  const ref = [];
-  for (const i of idx) ref.push(st.ref[i * 2], st.ref[i * 2 + 1]);
-  const r = findH(ref, out, CFG.ransacLK);
+  const ref = [], grp = [], g0 = groupsOf();
+  for (const i of idx) { ref.push(st.ref[i * 2], st.ref[i * 2 + 1]); grp.push(g0[i]); }
+  let r = findH(ref, out, CFG.ransacLK);
   if (!r || r.inliers < CFG.minInliersLK || !plausible(r.H)) return null;
-  const keepRef = [], keepCur = [];
+  // Точки опоры и окружение лежат в других плоскостях, чем холст (стол вокруг предмета, стена за ним): гомография по такой
+  // смеси «уезжает» при смене ракурса и даёт клин вместо рамки. Поэтому: хватает собственных точек холста — поза по ним
+  // одним (опоры остаются запасом); не хватает (рука, гладкая поверхность) — опоры/окружение ведут только аффинной
+  // моделью: сдвиг, поворот и масштаб держат, а перспектива из чужой плоскости не вмешивается.
+  let union = r.mask;
+  if (st.anchors.length) { // (авто-окружение не трогаем: пустой лист на ровной поверхности — там гомография точнее)
+    const ownI = [];
+    for (let i = 0; i < ref.length / 2; i++) if (!grp[i]) ownI.push(i);
+    st.ownN = ownI.length; st.ownModel = 'all';
+    if (ownI.length >= CFG.ownFew) {
+      const oRef = [], oOut = [];
+      for (const i of ownI) { oRef.push(ref[i * 2], ref[i * 2 + 1]); oOut.push(out[i * 2], out[i * 2 + 1]); }
+      // своих точек мало (логотип на гладком корпусе) — аффинная модель по ним: перспектива по горстке точек вырождается
+      const ro = ownI.length >= CFG.ownMin ? findH(oRef, oOut, CFG.ransacLK) : findAffine(oRef, oOut, CFG.ransacLK);
+      // поза по своим точкам и поза по всем (с опорами) сходятся — всё в одной плоскости, берём все точки (их больше);
+      // расходятся — опоры из другой плоскости, верим только своим
+      if (ro && ro.inliers >= CFG.ownFew * 0.8 && plausible(ro.H) && visDist(r.H, ro.H) > CFG.perspDev) {
+        union = Uint8Array.from(r.mask);
+        ownI.forEach((i, k) => { if (ro.mask[k]) union[i] = 1; });
+        r = { H: ro.H, inliers: ro.inliers, mask: union };
+        st.ownModel = 'own';
+      }
+    } else {
+      // ведут одни опоры. Если гомография по ним мало отличается от аффинной (опоры в одной плоскости с холстом) — оставляем её,
+      // если сильно (перспектива из другой плоскости — «клин») — берём аффинную
+      const ra = findAffine(ref, out, CFG.ransacLK);
+      if (ra && ra.inliers >= CFG.minInliersLK && plausible(ra.H) && visDist(r.H, ra.H) > CFG.perspDev) { r = { H: ra.H, inliers: ra.inliers, mask: r.mask }; st.ownModel = 'affine'; }
+    }
+  }
+  const keepRef = [], keepCur = [], keepGrp = [];
   for (let i = 0; i < r.mask.length; i++) {
     if (!r.mask[i]) continue;
     keepRef.push(ref[i * 2], ref[i * 2 + 1]);
     keepCur.push(out[i * 2], out[i * 2 + 1]);
+    keepGrp.push(grp[i]);
   }
-  return { H: r.H, inliers: r.inliers, ref: keepRef, cur: keepCur };
+  return { H: r.H, inliers: r.inliers, ref: keepRef, cur: keepCur, grp: keepGrp };
 }
 
 /** Засеять точки для оптического потока в текущем кадре по позе Hm. */
@@ -610,6 +670,8 @@ function seedPoints(Hm, keep) {
   if (st.skinOn && st.skin) cv.subtract(mask, st.skin, mask);
   const curPts = keep ? Array.from(st.cur) : [];
   const refPts = keep ? Array.from(st.ref) : [];
+  // группа точки: 0 — на самом холсте, 1 — опора/окружение (другая плоскость). Группа назначается при посеве и не меняется
+  const grpPts = keep ? Array.from(groupsOf()) : [];
   const need = CFG.maxCorners - curPts.length / 2;
   if (need > 10) {
     const fresh = detectGrid(mask, need, curPts);
@@ -618,12 +680,22 @@ function seedPoints(Hm, keep) {
       const r = applyH(inv, fresh[i], fresh[i + 1]);
       curPts.push(fresh[i], fresh[i + 1]);
       refPts.push(r[0], r[1]);
+      grpPts.push(pointInPoly(r[0], r[1], st.quad) ? 0 : 1); // за рамкой (поле поиска, окружение) — не точка холста
     }
   }
   mask.delete();
+  const n0 = curPts.length / 2;
   seedAnchors(Hm, curPts, refPts);
+  for (let i = n0; i < curPts.length / 2; i++) grpPts.push(1);
   st.cur = Float32Array.from(curPts);
   st.ref = Float32Array.from(refPts);
+  st.grp = Uint8Array.from(grpPts);
+}
+
+/** Группы точек потока (выровнены с st.cur); если выравнивания нет — все точки считаются точками холста. */
+function groupsOf() {
+  const n = st.cur.length / 2;
+  return st.grp && st.grp.length === n ? st.grp : new Uint8Array(n);
 }
 
 /** Опорные области (точки опоры): круги вокруг отмеченных пользователем неподвижных предметов, в текущем кадре. */
@@ -1290,6 +1362,7 @@ function track(msg) {
       pred = lk.H;
       st.cur = Float32Array.from(lk.cur);
       st.ref = Float32Array.from(lk.ref);
+      st.grp = Uint8Array.from(lk.grp);
       lkInl = lk.inliers;
     } else {
       st.cur = new Float32Array(0); st.ref = new Float32Array(0);
@@ -1379,6 +1452,8 @@ function track(msg) {
   lap('tmpl');
   const motion = quadDist(pred, Hprev);
   let radius = Math.round(Math.min(24, CFG.edgeRadius + (source === 'lk' ? 0 : motion * 0.5) + (wasLost ? 6 : 0)));
+  // поза получена по опорам/окружению из другой плоскости (своих точек у холста нет) — она может быть далеко от настоящих краёв
+  if (source === 'lk' && st.ownModel && st.ownModel !== 'own') radius = Math.max(radius, 44);
   // Когда поза по потоку надёжна, настоящий край должен лежать почти там, где предсказано. Узкое окно не даёт
   // позе «ползти» к ложному краю (контур пальцев поверх страницы, карандаш), пока настоящий закрыт рукой.
   const confident = source === 'lk' && lkInl >= 12;
@@ -1436,7 +1511,7 @@ function track(msg) {
     st.H = accepted;
     st.lost = 0; st.fail = 0;
     state = 'tracking';
-  } else if (!wasLost && (st.fail || 0) < CFG.coastMax && plausible(pred)) {
+  } else if (!wasLost && (st.fail || 0) < CFG.coastMax && plausible(pred) && shapeOk(pred)) {
     // кратковременный сбой (смаз, поза не сошлась): едем по инерции и пересеиваем точки, а не объявляем потерю
     st.fail = (st.fail || 0) + 1;
     st.prevH = st.fail > 1 ? null : Hprev; // экстраполяция по скорости — только первый кадр, дальше держим позу
@@ -1518,7 +1593,7 @@ function track(msg) {
     dbgPts: self.DEBUG_PTS ? Array.from(st.cur) : undefined,
     anchors: st.anchors.length ? anchorPositions() : undefined,
     anchorsDropped: anchorsDropped || undefined,
-    dbgEnv: [st.auto ? 1 : 0, st.envBad || 0, st.autoDropped ? 1 : 0, st.fullFrame ? 1 : 0],
+    dbgEnv: [st.auto ? 1 : 0, st.envBad || 0, st.autoDropped ? 1 : 0, st.fullFrame ? 1 : 0, st.ownN, st.ownModel],
   };
   if (defer) Object.defineProperty(out, 'defer', { value: defer, enumerable: false });
   return out;
