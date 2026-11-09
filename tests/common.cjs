@@ -21,7 +21,7 @@ async function launch({ port, viewport = { width: 420, height: 860 }, camera = f
   page.on('console', (m) => { if (m.type() === 'error') errors.push(m.text()); });
   page.on('dialog', (d) => d.accept());
   const close = async () => { await browser.close(); srv.close(); };
-  return { page, errors, close, url: `http://localhost:${port}` };
+  return { page, errors, close, context: ctx, url: `http://localhost:${port}` };
 }
 
 function check(cond, msg) {
@@ -37,8 +37,10 @@ if (!fs.existsSync(path.join(DATA, 'main', 'gt.json'))) {
 /** Номер кадра сцены main, зашитый штрихкодом (10 бит) в левый нижний угол видео 640×360. */
 const IDX_SRC = `(() => {
   const v = document.querySelector('#video');
+  const w = document.querySelector('#view');
+  const src = w && getComputedStyle(w).visibility === 'visible' ? w : v; // что видит пользователь
   const c = document.createElement('canvas'); c.width = 80; c.height = 10;
-  const ctx = c.getContext('2d'); ctx.drawImage(v, 0, 350, 80, 10, 0, 0, 80, 10);
+  const ctx = c.getContext('2d'); ctx.drawImage(src, 0, 350, 80, 10, 0, 0, 80, 10);
   const d = ctx.getImageData(0, 0, 80, 10).data;
   let idx = 0;
   for (let i = 0; i < 10; i++) if (d[(5 * 80 + 8 * i + 4) * 4] > 128) idx |= 1 << i;

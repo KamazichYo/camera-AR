@@ -177,12 +177,12 @@ export class ArTracker {
       if ('requestVideoFrameCallback' in v) v.requestVideoFrameCallback(tick);
       else requestAnimationFrame(tick);
     };
-    const tick = (nowT) => {
+    const tick = (nowT, md) => {
       if (!this.running || gen !== this._gen) return;
       if (this.busy || v.readyState < 2) return next();
       this.busy = true;
-      // момент, когда этот кадр показан на экране, — от него считается задержка позы
-      const frameTime = typeof nowT === 'number' ? nowT : performance.now();
+      // момент показа этого кадра (та же шкала времени, что у часов показанного кадра в приложении)
+      const frameTime = (md && md.presentationTime) || (typeof nowT === 'number' ? nowT : performance.now());
       this._send('frame')
         .then((r) => {
           this.busy = false;

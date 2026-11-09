@@ -628,7 +628,7 @@ function boxOf(q, m) {
 // Нужно там, где мало угловых точек: ладонь, пустая бумага, размытая картинка. ECC подбирает гомографию так,
 // чтобы ВСЯ заплатка (а не горстка точек) совпала с шаблоном по нормированной корреляции — яркость
 // не важна. Стартуем от предсказания потока, поэтому сходится за несколько итераций.
-const ECC = { side: 96, iters: 30, eps: 1e-3, gauss: 5, minCC: 0.7, lostCC: 0.8, recentCC: 0.6, recentEvery: 1, anchorEvery: 1, minTex: 4, suspect: 10 };
+const ECC = { side: 96, iters: 30, eps: 1e-3, gauss: 5, minCC: 0.7, lostCC: 0.8, recentCC: 0.75, recentEvery: 1, anchorEvery: 1, minTex: 4, suspect: 10 };
 
 /** «Свежая» заплатка: вид поверхности по текущей позе. Ведёт от кадра к кадру, пока вид меняется (поворот ладони). */
 function updateRecentEcc() {
@@ -1052,18 +1052,25 @@ function track(msg) {
   let ecc = null;
   if (st.tmpl && st.tmpl.ecc && st.tmpl.ecc.texStd >= ECC.minTex && (wasLost || st.lowTex || st.cur.length / 2 < CFG.eccSparse || st.frame % CFG.eccEvery === 0)) {
     const sane = (r) => r && plausible(r.H) && shapeOk(r.H) && quadDist(r.H, pred) < Math.max(W, H) * 0.15;
+    const coarse = wasLost || st.fail > 0;
+    // «свежая» заплатка сама по себе может зацепиться за фон: без подтверждения якорем верим ей, только если
+    // поток в этом кадре дал позу (source === 'lk') — иначе (телепортация, смаз) поза берётся только по якорю
+    const lkOk = source === 'lk' && lkInl >= CFG.minInliersLK;
     let rec = null;
     if (st.eccRecent) {
-      rec = eccRefine(pred, st.eccRecent, wasLost || st.fail > 0, true);
-      if (rec && rec.cc >= ECC.recentCC && sane(rec)) { pred = rec.H; ecc = rec; source = 'ecc-rec'; } else rec = null;
+      rec = eccRefine(pred, st.eccRecent, coarse, true);
+      if (!(rec && rec.cc >= ECC.recentCC && sane(rec))) rec = null;
     }
     // якорная заплатка снимает накопленный дрейф; пока «свежая» держит, хватает раза в несколько кадров
-    const anc = (!rec || wasLost || st.frame % ECC.anchorEvery === 0) ? eccRefine(pred, null, wasLost || st.fail > 0) : null;
+    const anc = (!rec || wasLost || st.frame % ECC.anchorEvery === 0) ? eccRefine(rec ? rec.H : pred, null, coarse) : null;
     if (anc && anc.cc >= (wasLost && !rec ? ECC.lostCC : ECC.minCC) && sane(anc)) {
-      pred = anc.H; ecc = anc; source = source === 'ecc-rec' ? 'ecc' : (wasLost ? 'ecc-reacq' : source + '+ecc');
+      pred = anc.H; ecc = anc; source = rec ? 'ecc' : (wasLost ? 'ecc-reacq' : source + '+ecc');
       st.ancLow = 0;
       if (anc.cc >= 0.85) st.Hgood = anc.H.slice(); // последняя поза, в которой вид совпадал с эталоном
-    } else if (anc !== null || !rec) st.ancLow = (st.ancLow || 0) + 1;
+    } else {
+      if (rec && lkOk) { pred = rec.H; ecc = rec; source = 'ecc-rec'; }
+      if (anc !== null || !rec) st.ancLow = (st.ancLow || 0) + 1;
+    }
     // Самоконтроль: «свежая» заплатка может незаметно увести позу, пока якорная давно не сходится.
     // Тогда пробуем перезахват по якорю от последней хорошей позы и от стартовой (ладонь часто возвращается).
     if ((st.ancLow || 0) >= ECC.suspect && st.frame % 3 === 0) {
@@ -1156,6 +1163,7 @@ function track(msg) {
   lap('upkeep');
 
   const tmp = prevNorm; prevNorm = norm; norm = tmp;
+  while (self.DEBUG_MIN_MS && now() - tStart < self.DEBUG_MIN_MS) { /* тесты: имитация медленного устройства */ }
   return {
     type: 'pose',
     state,
@@ -1725,6 +1733,7 @@ self.onmessage = async (e) => {
     let res;
     if (msg.type === 'lock') res = lock(msg);
     else if (msg.type === 'frame') res = sel ? selFrame(msg) : track(msg);
+    else if (msg.type === 'debugMinMs') { self.DEBUG_MIN_MS = msg.ms; res = { type: 'ok' }; }
     else if (msg.type === 'selStart') res = selStart(msg);
     else if (msg.type === 'selTap') res = selTap(msg);
     else if (msg.type === 'selBack') res = selBack();
