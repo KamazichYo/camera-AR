@@ -36,6 +36,7 @@ const CFG = {
   wPersp: 0.6,            // вес штрафа за перспективу в оптимизаторе
   coastMax: 8,            // сколько кадров подряд ехать по инерции при сбое, прежде чем объявить потерю
   edgeGate: 100,            // px: когда поза по потоку надёжна, край ищется только в такой окрестности предсказания
+  eccVsLk: 5,             // px: допустимое расхождение ECC с уверенной позой по потоку (на видимой части холста)
   envEdgeErr: 4.5,        // px: края листа стабильно дальше этого от позы по фону — лист двигают отдельно от окружения
   liteMs: 55,             // среднее время кадра выше этого (слабый телефон) — включается облегчённый режим (ниже 0.75× — выключается)
   anchorPts: 14,          // сколько точек потока держим в каждой опорной области
@@ -279,6 +280,21 @@ function shapeOk(Hm) {
   return c.ratio >= 0.4 * st.shape0.ratio && c.minAng >= Math.min(0.5, 0.45 * st.shape0.minAng);
 }
 
+/** Расхождение двух поз там, где холст виден в кадре (сетка точек холста внутри кадра): углы за кадром дают огромные, но неважные цифры. */
+function visDist(H1, H2) {
+  const q = st.quad, xs = q.map((p) => p[0]), ys = q.map((p) => p[1]);
+  const x0 = Math.min(...xs), x1 = Math.max(...xs), y0 = Math.min(...ys), y1 = Math.max(...ys);
+  let s = 0, n = 0;
+  for (let i = 0; i <= 4; i++) for (let j = 0; j <= 4; j++) {
+    const x = x0 + (x1 - x0) * i / 4, y = y0 + (y1 - y0) * j / 4;
+    const a = applyH(H1, x, y);
+    if (!(a[0] >= 0 && a[1] >= 0 && a[0] < W && a[1] < H)) continue;
+    const b = applyH(H2, x, y);
+    s += Math.hypot(a[0] - b[0], a[1] - b[1]); n++;
+  }
+  return n >= 4 ? s / n : quadDist(H1, H2);
+}
+
 function quadDist(H1, H2) {
   let s = 0;
   for (const [x, y] of st.quad) {
@@ -402,7 +418,8 @@ function dropState() {
   if (st.tmpl) { st.tmpl.img.delete(); st.tmpl.crop.delete(); if (st.tmpl.ecc) st.tmpl.ecc.T.delete(); }
   if (st.eccRecent) st.eccRecent.delete();
   if (st.skin) st.skin.delete();
-  st.tmpl = null; st.eccRecent = null; st.skin = null;
+  if (st.validFrame) st.validFrame.m.delete();
+  st.tmpl = null; st.eccRecent = null; st.skin = null; st.validFrame = null;
 }
 
 /** Сопоставление ORB текущего кадра с ключевыми кадрами. */
@@ -764,6 +781,22 @@ function eccBox() {
 }
 
 /** Гомография «опорные → текущие координаты», уточнённая плотным выравниванием от предсказания Hm. */
+/**
+ * Допустимые пиксели кадра для ECC: не кожа (рука закрывает холст) и внутри кадра (за краем кадра после разворота
+ * остаётся размазанная кромка — она давала ложную структуру). Маска кадра кэшируется на кадр.
+ */
+function eccValid(Hmat, box) {
+  if (!st.validFrame || st.validFrame.f !== st.frame) {
+    if (st.validFrame) st.validFrame.m.delete();
+    const m = new cv.Mat(H, W, cv.CV_8UC1, new cv.Scalar(255));
+    if (st.skinOn && st.skin) cv.subtract(m, st.skin, m);
+    st.validFrame = { f: st.frame, m };
+  }
+  const out = new cv.Mat();
+  cv.warpPerspective(st.validFrame.m, out, Hmat, new cv.Size(box.w, box.h), cv.INTER_NEAREST | cv.WARP_INVERSE_MAP, cv.BORDER_CONSTANT, new cv.Scalar(0));
+  return out;
+}
+
 function eccRefine(Hm, Tpl, coarse, affine) {
   const e = st.tmpl && st.tmpl.ecc;
   if (!e) return null;
@@ -773,6 +806,9 @@ function eccRefine(Hm, Tpl, coarse, affine) {
   const Hmat = cv.matFromArray(3, 3, cv.CV_64F, mulH(Hm, Tfi));  // заплатка → текущий кадр
   const U = new cv.Mat();
   cv.warpPerspective(gray, U, Hmat, new cv.Size(box.w, box.h), cv.INTER_LINEAR | cv.WARP_INVERSE_MAP, cv.BORDER_REPLICATE);
+  const V = eccValid(Hmat, box);
+  // закрыто рукой или вне кадра больше 60% заплатки — выравнивать нечем (ECC уехал бы вместе с рукой)
+  if (cv.countNonZero(V) < 0.4 * box.w * box.h) { Hmat.delete(); U.delete(); V.delete(); return null; }
   const C = affine ? cv.Mat.eye(2, 3, cv.CV_32F) : cv.Mat.eye(3, 3, cv.CV_32F);
   const motion = affine ? cv.MOTION_AFFINE : cv.MOTION_HOMOGRAPHY;
   if (coarse) {
@@ -781,19 +817,21 @@ function eccRefine(Hm, Tpl, coarse, affine) {
     const sz = new cv.Size(Math.max(16, box.w >> 1), Math.max(16, box.h >> 1));
     cv.resize(Tpl || e.T, T2, sz, 0, 0, cv.INTER_AREA);
     cv.resize(U, U2, sz, 0, 0, cv.INTER_AREA);
+    const V2 = new cv.Mat();
+    cv.resize(V, V2, sz, 0, 0, cv.INTER_NEAREST);
     let cc2 = -1;
-    try { cc2 = cv.findTransformECC(T2, U2, C2, motion, new cv.TermCriteria(3, 50, 1e-3), new cv.Mat(), 3); } catch (err) { cc2 = -1; }
+    try { cc2 = cv.findTransformECC(T2, U2, C2, motion, new cv.TermCriteria(3, 50, 1e-3), V2, 3); } catch (err) { cc2 = -1; }
     if (cc2 > 0.3) {
       const sx = sz.width / box.w, sy = sz.height / box.h, Sf = [sx, 0, 0, 0, sy, 0, 0, 0, 1];
       const c2 = Array.from(C2.data32F);
       const Cf = mulH(invertH(Sf), mulH(c2.length === 6 ? c2.concat([0, 0, 1]) : c2, Sf));
       C.data32F.set(c2.length === 6 ? Cf.slice(0, 6) : Cf);
     }
-    T2.delete(); U2.delete(); C2.delete();
+    T2.delete(); U2.delete(); C2.delete(); V2.delete();
   }
   let cc = -1;
   try {
-    cc = cv.findTransformECC(Tpl || e.T, U, C, motion, new cv.TermCriteria(3, ECC.iters, ECC.eps), new cv.Mat(), ECC.gauss);
+    cc = cv.findTransformECC(Tpl || e.T, U, C, motion, new cv.TermCriteria(3, ECC.iters, ECC.eps), V, ECC.gauss);
   } catch (err) { cc = -1; } // не сошлось
   let res = null;
   if (cc > 0) {
@@ -802,8 +840,18 @@ function eccRefine(Hm, Tpl, coarse, affine) {
     const k = Hn[8];
     res = { H: Hn.map((v) => v / k), cc };
   }
-  Hmat.delete(); U.delete(); C.delete();
+  Hmat.delete(); U.delete(); C.delete(); V.delete();
   return res;
+}
+
+/** Доля кожи внутри рамки холста в текущем кадре (0, если маска кожи выключена). */
+function skinOnCanvas() {
+  if (!st.skinOn || !st.skin) return 0;
+  const inner = polyMask(mapQuad(st.H, st.quad)), t = cv.countNonZero(inner);
+  cv.bitwise_and(inner, st.skin, inner);
+  const r = t ? cv.countNonZero(inner) / t : 0;
+  inner.delete();
+  return r;
 }
 
 function updateTemplate() {
@@ -1269,7 +1317,10 @@ function track(msg) {
   // (первый кадр — без дрейфа). Нужно, когда точек потока мало (кожа, бумага) или поза потеряна.
   let ecc = null;
   if (st.tmpl && st.tmpl.ecc && st.eccOk && (wasLost || st.lowTex || st.cur.length / 2 < CFG.eccSparse || st.frame % CFG.eccEvery === 0)) {
-    const sane = (r) => r && plausible(r.H) && shapeOk(r.H) && quadDist(r.H, pred) < Math.max(W, H) * 0.15;
+    // поток уверенно держит позу, а плотное выравнивание с ней резко спорит (закрашенный холст, рука на заплатке) — верим потоку
+    const lkPose = source === 'lk' && lkInl >= 25 ? pred.slice() : null;
+    const sane = (r) => r && plausible(r.H) && shapeOk(r.H) && quadDist(r.H, pred) < Math.max(W, H) * 0.15 &&
+      (!lkPose || visDist(r.H, lkPose) < CFG.eccVsLk);
     const coarse = wasLost || st.fail > 0;
     // «свежая» заплатка сама по себе может зацепиться за фон: без подтверждения якорем верим ей, только если
     // поток в этом кадре дал позу (source === 'lk') — иначе (телепортация, смаз) поза берётся только по якорю
@@ -1291,7 +1342,7 @@ function track(msg) {
     }
     // Самоконтроль: «свежая» заплатка может незаметно увести позу, пока якорная давно не сходится.
     // Тогда пробуем перезахват по якорю от последней хорошей позы и от стартовой (ладонь часто возвращается).
-    if ((st.ancLow || 0) >= ECC.suspect && st.frame % 3 === 0) {
+    if ((st.ancLow || 0) >= ECC.suspect && st.frame % 3 === 0 && !lkPose) { // поток уверен — это закрашенный холст, а не потеря: перезахват только ухудшил бы позу
       for (const Hc of [st.Hgood, I3()]) {
         if (!Hc) continue;
         const rr = eccRefine(Hc, null, true);
@@ -1405,7 +1456,12 @@ function track(msg) {
     if (st.frame % 10 === 0 && (st.cur.length / 2 < CFG.maxCorners - 15 || st.anchors.length) && !st.fail) seedPoints(st.H, true);
     // рисунок заметно изменился — обновляем шаблон
     if (!pairs.skipped) st.tmpl.low = st.tmpl.n >= 8 && pairs.ratio < 0.4 ? st.tmpl.low + 1 : 0;
-    if (st.tmpl.low > 20 && st.stable > 5 && !st.fail && !st.auto) updateTemplate(); // у пустой бумаги шаблон не переучиваем: туда попадает рука
+    // холст закрашивают: эталон по кадру захвата больше не совпадает (якорная заплатка давно не сходится) — переучиваем
+    // его по текущему виду, но не когда на холсте рука (в эталон попала бы кожа); у пустой бумаги — не переучиваем
+    const repaint = (st.ancLow || 0) > 5 && lkInl >= 25;
+    if ((st.tmpl.low > 20 || repaint) && st.stable > 5 && !st.fail && !st.auto && skinOnCanvas() < 0.03) {
+      updateTemplate(); st.ancLow = 0; st.tmpl.low = 0;
+    }
     if (st.tmpl && st.tmpl.ecc && !st.fail && st.frame % ECC.recentEvery === 0) updateRecentEcc(); // не запоминаем позу «по инерции»
     // новый ключевой кадр: позиция стабильна и недавно подтверждена ORB
     const t = now();
