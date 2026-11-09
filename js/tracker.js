@@ -116,10 +116,11 @@ export class ArTracker {
     return multiply([1 / sx, 0, 0, 0, 1 / sy, 0, 0, 0, 1], multiply(Hp, [sx, 0, 0, 0, sy, 0, 0, 0, 1]));
   }
 
+  /** Варианты холста в кадре (лучший первым), углы в координатах видео. */
   async detectCanvas() {
     await this.init();
     const r = await this._send('detect');
-    return r.quad ? this._fromProc(r.quad) : null;
+    return (r.cands || []).map((c) => ({ ...c, q: this._fromProc(c.q) }));
   }
 
   /** Начать отслеживание. quad — холст в координатах видео (текущий кадр становится опорным). */

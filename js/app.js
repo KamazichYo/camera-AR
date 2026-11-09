@@ -204,7 +204,7 @@ const overlayEditor = new QuadEditor(stage, {
 
 const selectEditor = new QuadEditor(stage, {
   getQuad: () => ar.selectQuad,
-  setQuad: (q) => { ar.selectQuad = q; },
+  setQuad: (q) => { ar.selectQuad = clampToView(q); },
   allowPinch: false,
 });
 
@@ -224,6 +224,7 @@ async function arBegin() {
     if (ar.mode !== 'loading') return;
     const r = stage.visibleRect();
     ar.selectQuad = fitRect(4, 3, r.cx, r.cy, r.w * 0.7, r.h * 0.7);
+    detectCands = []; detectIdx = -1;
     ar.mode = 'select';
     updateArUi();
     toast('Совместите углы рамки с углами холста', { ms: 2500 });
@@ -236,14 +237,37 @@ async function arBegin() {
   }
 }
 
+/** Углы рамки выбора держим в видимой области, чтобы их можно было ухватить пальцем. */
+function clampToView(q) {
+  const r = stage.visibleRect();
+  const pad = 22 / stage.s; // 22 экранных пикселя
+  const x0 = r.x + pad, x1 = r.x + r.w - pad, y0 = r.y + pad, y1 = r.y + r.h - pad;
+  return q.map(([x, y]) => [Math.min(x1, Math.max(x0, x)), Math.min(y1, Math.max(y0, y))]);
+}
+
+let detectCands = [], detectIdx = -1;
+
 async function autoDetect(silent = false) {
   try {
-    const q = await tracker.detectCanvas();
+    // повторное нажатие «Найти» перебирает найденные варианты
+    if (!silent && detectCands.length > 1) {
+      detectIdx = (detectIdx + 1) % detectCands.length;
+    } else {
+      detectCands = (await tracker.detectCanvas()).filter((c) => isConvexQuad(c.q, 1000));
+      detectIdx = 0;
+    }
     if (ar.mode !== 'select') return;
-    if (q && isConvexQuad(q, 1000)) {
-      ar.selectQuad = orderQuad(q);
-      if (!silent) toast('Холст найден — при необходимости поправьте углы');
-    } else if (!silent) toast('Не удалось найти холст автоматически — поставьте углы вручную');
+    if (!detectCands.length) {
+      if (!silent) toast('Не удалось найти холст автоматически — поставьте углы вручную. Поможет контрастный фон за холстом.');
+      return;
+    }
+    const q = clampToView(orderQuad(detectCands[detectIdx].q));
+    if (isConvexQuad(q, 1000)) ar.selectQuad = q;
+    if (!silent) {
+      const n = detectCands.length;
+      toast(n > 1 ? `Вариант холста ${detectIdx + 1} из ${n}. Не тот? Нажмите «Найти» ещё раз — покажу следующий. Углы можно поправить пальцем.`
+        : 'Найден возможный холст — проверьте и при необходимости поправьте углы');
+    }
   } catch (e) { if (!silent) toast('Ошибка поиска: ' + e.message); }
 }
 
