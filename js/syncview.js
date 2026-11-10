@@ -211,6 +211,32 @@ export class SyncView {
     this.grabMs += 0.1 * ((performance.now() - t0) - this.grabMs); // снимок + уменьшенный кадр для трекера
   }
 
+  /**
+   * Метки времени кадров камеры дрожат на несколько мс (особенно на телефонах). Выбор кадра «последний, чья метка не позже
+   * момента показа» из-за этого иногда держит кадр 1, а иногда 3 отрисовки подряд — картинка идёт рывками. Поэтому метки
+   * приводятся к ровной сетке (период и фаза оцениваются на лету); если кадры идут нерегулярно — метка остаётся как есть.
+   */
+  _regUpdate(T) {
+    if (!this.fpLast) { this.fpLast = T; return T; }
+    const dt = T - this.fpLast;
+    this.fpLast = T;
+    if (dt < 8 || dt > 90) { this.fp = 0; return T; }          // пауза/смена частоты — оценка заново
+    if (!this.fp) { this.fp = dt; this.ft0 = T; return T; }
+    const n = Math.max(1, Math.round(dt / this.fp));
+    const per = dt / n;
+    if (Math.abs(per - this.fp) < 0.25 * this.fp) this.fp += 0.04 * (per - this.fp);
+    return this._reg(T, true);
+  }
+
+  _reg(T, learn = false) {
+    if (!this.fp) return T;
+    const k = Math.round((T - this.ft0) / this.fp);
+    const g = this.ft0 + k * this.fp, r = T - g;
+    if (Math.abs(r) > 0.3 * this.fp) { if (learn) this.ft0 = T; return T; } // кадр не на сетке — не трогаем
+    if (learn) this.ft0 += 0.08 * r; // фаза плавно следует за камерой
+    return g;
+  }
+
   async _grab(T) {
     if (this.glf) return this._grabGl(T);
     if (!this.showing) return; // запасной путь снимает кадры только для показа
