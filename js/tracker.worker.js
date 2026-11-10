@@ -24,12 +24,13 @@
 
 const CFG = {
   sbi: true,              // грубое предсказание движения по маленькому кадру (см. coarseShift)
-  sbiMinMove: 12,         // px: меньшее движение поток находит сам
+  sbiMinMove: 12,
+  sup: true,              // автоопоры на плоскости холста (см. supUpkeep)         // px: меньшее движение поток находит сам
   maxCorners: 160,
   minCorners: 25,
   cornerQuality: 0.006,
   cornerMinDist: 7,
-  lkWin: 21,
+  lkWin: 21,              // окно потока (15 px быстрее на ≈ 3 мс, но у целей с малым числом деталей рамка начинает плыть)
   lkLevels: 3,
   fbMaxErr: 1.5,          // px — допустимая ошибка проверки вперёд-назад
   lkBackCheck: false,     // межкадровый поток — только прогноз, RANSAC и шаблон отсеют ошибки
@@ -894,6 +895,188 @@ function reanchor(Hm) {
   }
 }
 
+// ---------- автоопоры: неподвижные точки той же плоскости, что и холст ----------
+// Холст в кадре часто мал (карта на столе, лист на мольберте) или закрыт рукой: поза по нему одному шумит — рамка
+// дрожит и «плывёт» при смене ракурса. Вокруг же обычно есть та же плоскость (стол, стена) с массой деталей.
+// Трекер сам сеет точки-кандидаты по всему кадру вне холста и следит за каждой. Точка той же плоскости, неподвижная
+// относительно холста, при любом движении камеры едет по той же гомографии, что и холст; точка другой плоскости или
+// движущийся предмет — нет, и это видно, как только камера сместилась (параллакс). Кандидат, выдержавший проверку при
+// достаточном смещении камеры, становится опорой: участвует в оценке позы наравне с точками холста. Опоры проверяются
+// каждый кадр и выбывают, если перестали сходиться с холстом (предмет подвинули, лист сдвинули по столу).
+const SUP = {
+  max: 64,          // всего точек (кандидаты + опоры)
+  grid: 4,          // сетка ячеек по кадру: точки равномерно, а не кучей
+  perCell: 4,
+  expand: 0.14,     // запас вокруг холста, где кандидатов не сеем (кромка, тень, толщина подрамника)
+  parallax: 0.07,   // на сколько должна сместиться камера (доля расстояния до плоскости), чтобы проверка что-то значила
+  loose: 2.5, looseK: 0.02, // px (+ доля расстояния до холста): грубый отбор по позе холста (вдали от холста она неточна)
+  tight: 1.6,       // px: согласие с общей гомографией плоскости
+  keep: 2.5,        // px: опора дальше этого от своего места — промах
+  alpha: 0.05,      // скорость подстройки опорных координат (усреднение шума позы; медленный дрейф потока)
+  minUse: 8,        // меньше стольких согласных опор — в оценке позы они не участвуют
+  minPose: 12,      // столько опор — поза по ним одним, если свой поток холста сорвался
+  focal: 0.85,      // фокусное расстояние в долях длинной стороны кадра (основная камера телефона)
+};
+
+/** Подтверждённые опоры для показа: координаты опорного кадра (как у рамки). */
+function supOut() {
+  if (!st.sup) return undefined;
+  const o = [];
+  for (const p of st.sup.pts) if (p.ok) o.push([+(p.rx + 0.5).toFixed(1), +(p.ry + 0.5).toFixed(1)]);
+  return o.length >= SUP.minUse ? o : [];
+}
+
+function supReset() { st.sup = { pts: [], batches: new Map(), nextId: 1 }; }
+
+/** Насколько гомография G (кадр → кадр) отличается от чистого поворота камеры: ≈ сдвиг камеры / расстояние до плоскости. */
+function parallaxOf(G) {
+  const f = SUP.focal * Math.max(W, H), cx = W / 2, cy = H / 2;
+  const M = mulH([1 / f, 0, -cx / f, 0, 1 / f, -cy / f, 0, 0, 1], mulH(G, [f, 0, cx, 0, f, cy, 0, 0, 1]));
+  // сингулярные числа M: собственные числа симметричной MᵀM (замкнутая формула)
+  const a = [0, 0, 0, 0, 0, 0, 0, 0, 0];
+  for (let i = 0; i < 3; i++) for (let j = 0; j < 3; j++) a[i * 3 + j] = M[i] * M[j] + M[3 + i] * M[3 + j] + M[6 + i] * M[6 + j];
+  const q = (a[0] + a[4] + a[8]) / 3;
+  const p1 = a[1] * a[1] + a[2] * a[2] + a[5] * a[5];
+  const p2 = (a[0] - q) ** 2 + (a[4] - q) ** 2 + (a[8] - q) ** 2 + 2 * p1;
+  const pp = Math.sqrt(p2 / 6);
+  if (!(pp > 1e-12 * Math.abs(q))) return 0;
+  const b = a.map((v, i) => (v - (i % 4 === 0 ? q : 0)) / pp);
+  const det = b[0] * (b[4] * b[8] - b[5] * b[7]) - b[1] * (b[3] * b[8] - b[5] * b[6]) + b[2] * (b[3] * b[7] - b[4] * b[6]);
+  const phi = Math.acos(Math.max(-1, Math.min(1, det / 2))) / 3;
+  const e1 = q + 2 * pp * Math.cos(phi), e3 = q + 2 * pp * Math.cos(phi + 2 * Math.PI / 3);
+  return e3 > 0 ? Math.sqrt(e1 / e3) - 1 : 1;
+}
+
+/** Провести точки автоопор из прошлого кадра в текущий. G — ожидаемое движение плоскости холста (или null). */
+function supTrack(G) {
+  const S = st.sup;
+  if (!S || !S.pts.length) return;
+  const n = S.pts.length, flat = new Float32Array(n * 2);
+  let init = null;
+  S.pts.forEach((p, i) => { flat[i * 2] = p.x; flat[i * 2 + 1] = p.y; });
+  if (G) {
+    init = new Float32Array(n * 2);
+    S.pts.forEach((p, i) => { const q = applyH(G, p.x, p.y); init[i * 2] = q[0]; init[i * 2 + 1] = q[1]; });
+  }
+  const { idx, out } = lkPairs(prevNorm, norm, flat, CFG.lkWin, G ? 2 : CFG.lkLevels, false, init);
+  const keep = [];
+  for (let k = 0; k < idx.length; k++) {
+    const p = S.pts[idx[k]], x = out[k * 2], y = out[k * 2 + 1];
+    if (x < 6 || y < 6 || x > W - 7 || y > H - 7) continue;
+    p.x = x; p.y = y; keep.push(p);
+  }
+  S.pts = keep;
+}
+
+/** Поза по одним опорам (когда собственный поток холста сорвался). */
+function supPose() {
+  const S = st.sup;
+  if (!S) return null;
+  const ref = [], cur = [];
+  for (const p of S.pts) if (p.ok) { ref.push(p.rx, p.ry); cur.push(p.x, p.y); }
+  if (ref.length / 2 < SUP.minPose) return null;
+  const r = findH(ref, cur, CFG.ransacLK, 500);
+  return r && r.inliers >= SUP.minPose && r.inliers >= 0.6 * ref.length / 2 && plausible(r.H) ? r.H : null;
+}
+
+/** Пары «опорные ↔ текущие» по подтверждённым опорам, согласным с прогнозом позы. */
+function supPairs(Hm) {
+  const res = { ref: [], cur: [] };
+  const S = st.sup;
+  if (!S) return res;
+  for (const p of S.pts) {
+    if (!p.ok) continue;
+    const q = applyH(Hm, p.rx, p.ry);
+    if (Math.hypot(q[0] - p.x, q[1] - p.y) < 3) { res.ref.push([p.rx, p.ry]); res.cur.push([p.x, p.y]); }
+  }
+  // настоящая общая плоскость (стол, стена) даёт десятки опор; несколько штук — случайные совпадения в чужой плоскости
+  if (res.ref.length < SUP.minUse) return { ref: [], cur: [] };
+  return res;
+}
+
+/** Проверка опор и кандидатов по принятой позе кадра; досев кандидатов. Вызывается после отправки позы. */
+function supUpkeep(Hm) {
+  const S = st.sup, inv = invertH(Hm);
+  if (!S || !inv) return;
+  for (const p of S.pts) {
+    if (!p.ok) continue;
+    const q = applyH(Hm, p.rx, p.ry);
+    if (Math.hypot(q[0] - p.x, q[1] - p.y) > SUP.keep) { p.bad++; continue; }
+    p.bad = 0; p.n++;
+    const r = applyH(inv, p.x, p.y), al = Math.max(SUP.alpha, 1 / (p.n + 1));
+    p.rx += al * (r[0] - p.rx); p.ry += al * (r[1] - p.ry);
+  }
+  const qn = mapQuad(Hm, st.quad), qc = centroid(qn);
+  for (const [id, b] of S.batches) {
+    const cand = S.pts.filter((p) => !p.ok && p.b === id);
+    if (!cand.length) { S.batches.delete(id); continue; }
+    const G0 = mulH(Hm, b.Hinv); // кадр посева → текущий кадр, по позе холста
+    b.pmax = Math.max(b.pmax, parallaxOf(G0));
+    const src = [], dst = [], sel = [];
+    for (const p of cand) {
+      const q = applyH(G0, p.sx, p.sy);
+      const far = Math.hypot(p.x - qc[0], p.y - qc[1]);
+      if (Math.hypot(q[0] - p.x, q[1] - p.y) < SUP.loose + SUP.looseK * far) { sel.push(p); src.push(p.sx, p.sy); dst.push(p.x, p.y); } else p.bad += 2;
+    }
+    // общая гомография плоскости по кандидатам, привязанная к холсту (точки рамки идут в подгонку наравне с кандидатами)
+    let G1 = G0;
+    if (sel.length >= 6) {
+      const q0 = mapQuad(b.H, st.quad);
+      for (let i = 0; i < 4; i++) for (const k of [0, 0.5]) {
+        const j = (i + 1) % 4;
+        src.push(q0[i][0] + k * (q0[j][0] - q0[i][0]), q0[i][1] + k * (q0[j][1] - q0[i][1]));
+        dst.push(qn[i][0] + k * (qn[j][0] - qn[i][0]), qn[i][1] + k * (qn[j][1] - qn[i][1]));
+      }
+      const r = findH(src, dst, SUP.tight, 300);
+      if (r && q0.every((c, i) => { const m = applyH(r.H, c[0], c[1]); return Math.hypot(m[0] - qn[i][0], m[1] - qn[i][1]) < 3; })) G1 = r.H;
+    }
+    for (const p of sel) {
+      const q = applyH(G1, p.sx, p.sy);
+      if (Math.hypot(q[0] - p.x, q[1] - p.y) > SUP.tight) { p.bad++; continue; }
+      p.age++;
+      if (b.pmax >= SUP.parallax && p.bad === 0 && p.age >= 4) {
+        p.ok = true; p.n = 0;
+        const r = applyH(inv, p.x, p.y);
+        p.rx = r[0]; p.ry = r[1];
+      }
+    }
+  }
+  S.pts = S.pts.filter((p) => p.bad < (p.ok ? 3 : 2));
+  if (st.frame % 8 === 2 && S.pts.length <= SUP.max - 8) supSeed(Hm, inv);
+}
+
+/** Посев кандидатов: углы по ячейкам сетки всего кадра, вне холста. */
+function supSeed(Hm, inv) {
+  const S = st.sup;
+  const mask = new cv.Mat(H, W, cv.CV_8UC1, new cv.Scalar(255));
+  const big = polyMask(mapQuad(Hm, expandQuad(st.quad, SUP.expand)));
+  cv.subtract(mask, big, mask);
+  big.delete();
+  const G = SUP.grid, fresh = [];
+  for (let gy = 0; gy < G; gy++) for (let gx = 0; gx < G; gx++) {
+    const rx = Math.round(8 + gx * (W - 16) / G), ry = Math.round(8 + gy * (H - 16) / G);
+    const rw = Math.round(8 + (gx + 1) * (W - 16) / G) - rx, rh = Math.round(8 + (gy + 1) * (H - 16) / G) - ry;
+    const ex = [];
+    for (const p of S.pts) if (p.x >= rx && p.x < rx + rw && p.y >= ry && p.y < ry + rh) ex.push(p.x - rx, p.y - ry);
+    const need = Math.min(SUP.perCell - ex.length / 2, SUP.max - S.pts.length - fresh.length / 2);
+    if (need < 1) continue;
+    const rect = new cv.Rect(rx, ry, rw, rh);
+    const m = mask.roi(rect).clone();
+    if (cv.countNonZero(m) > 150) {
+      const g = gray.roi(rect).clone();
+      const pts = detectCorners(g, m, need, ex, null);
+      for (let i = 0; i < pts.length; i += 2) fresh.push(pts[i] + rx, pts[i + 1] + ry);
+      g.delete();
+    }
+    m.delete();
+  }
+  mask.delete();
+  if (fresh.length < 2) return;
+  const id = S.nextId++;
+  S.batches.set(id, { H: Hm.slice(), Hinv: inv, pmax: 0 });
+  for (let i = 0; i < fresh.length; i += 2) S.pts.push({ x: fresh[i], y: fresh[i + 1], sx: fresh[i], sy: fresh[i + 1], rx: 0, ry: 0, ok: false, bad: 0, age: 0, n: 0, b: id });
+}
+
 // ---------- шаблон ----------
 function warpToRef(img, Hm) {
   const Hmat = cv.matFromArray(3, 3, cv.CV_64F, Hm);
@@ -1167,18 +1350,23 @@ function learnEdges() {
 let skinLo = null, skinHi = null;
 /** Бинарная маска «кожа» по текущему кадру: YCrCb-диапазон + небольшое расширение. Освобождать вызывающему. */
 function computeSkin() {
-  const rgb = new cv.Mat(), ycc = new cv.Mat(), m = new cv.Mat();
-  cv.cvtColor(rgba, rgb, cv.COLOR_RGBA2RGB);
+  // считается на уменьшенном вдвое кадре (вчетверо дешевле) и растягивается обратно: маске точность до пикселя не нужна
+  const half = new cv.Mat(), rgb = new cv.Mat(), ycc = new cv.Mat(), m2 = new cv.Mat(), m = new cv.Mat();
+  // (на пустой бумаге с рукой граница маски важна до пикселя — там считаем на полном кадре)
+  const sd = st && st.weakTex ? 1 : 2, hw = Math.max(1, Math.round(W / sd)), hh = Math.max(1, Math.round(H / sd));
+  cv.resize(rgba, half, new cv.Size(hw, hh), 0, 0, cv.INTER_NEAREST);
+  cv.cvtColor(half, rgb, cv.COLOR_RGBA2RGB);
   cv.cvtColor(rgb, ycc, cv.COLOR_RGB2YCrCb);
-  if (!skinLo || skinLo.rows !== H || skinLo.cols !== W) {
+  if (!skinLo || skinLo.rows !== hh || skinLo.cols !== hw) {
     if (skinLo) { skinLo.delete(); skinHi.delete(); }
-    skinLo = new cv.Mat(H, W, cv.CV_8UC3, new cv.Scalar(40, 140, 80));
-    skinHi = new cv.Mat(H, W, cv.CV_8UC3, new cv.Scalar(255, 178, 128));
+    skinLo = new cv.Mat(hh, hw, cv.CV_8UC3, new cv.Scalar(40, 140, 80));
+    skinHi = new cv.Mat(hh, hw, cv.CV_8UC3, new cv.Scalar(255, 178, 128));
   }
-  cv.inRange(ycc, skinLo, skinHi, m);
-  const k = cv.getStructuringElement(cv.MORPH_ELLIPSE, new cv.Size(7, 7));
-  cv.dilate(m, m, k);
-  [rgb, ycc, k].forEach((x) => x.delete());
+  cv.inRange(ycc, skinLo, skinHi, m2);
+  const k = cv.getStructuringElement(cv.MORPH_ELLIPSE, new cv.Size(sd === 1 ? 7 : 5, sd === 1 ? 7 : 5));
+  cv.dilate(m2, m2, k);
+  cv.resize(m2, m, new cv.Size(W, H), 0, 0, cv.INTER_NEAREST);
+  [half, rgb, ycc, m2, k].forEach((x) => x.delete());
   return m;
 }
 const onSkin = (m, x, y) => {
@@ -1428,6 +1616,7 @@ function startTracking(quad, msg) {
     initialPts: 0,
     shape0: null,
     ancLow: 0,
+    weakTex: true,
     Hgood: null,
   };
   // маска кожи включается, только если внутри рамки кожи нет (на ладони цель — сама кожа)
@@ -1439,6 +1628,7 @@ function startTracking(quad, msg) {
     sm.delete(); inner.delete();
     st.skin = st.skinOn ? computeSkin() : null;
   }
+  supReset();
   learnEdges();
   seedPoints(st.H, false);
   // у пустой бумаги своих признаков почти нет — держимся за окружение (статичные предметы вокруг)
@@ -1453,6 +1643,7 @@ function startTracking(quad, msg) {
     }
   }
   st.initialPts = st.cur.length / 2;
+  st.weakTex = !!st.auto || st.initialPts < 60;
   setTemplate(gray, null);
   st.eccOk = st.tmpl.ecc.texStd >= ECC.minTex; // текстура считается один раз — по эталонному кадру (позже в заплатку может попасть рука)
   st.keyframes.push(makeKeyframe(gray, st.H, now()));
@@ -1524,11 +1715,20 @@ function track(msg) {
       st.cur = new Float32Array(0); st.ref = new Float32Array(0);
     }
   }
+  // автоопоры: свой поток холста сорвался — поза по опорам на той же плоскости
+  let supDone = false;
+  const supOn = CFG.sup && !wasLost && !st.fullFrame && st.sup;
+  if (!pred && supOn) {
+    supTrack(null); supDone = true;
+    const hs = supPose();
+    if (hs && quadDist(hs, Hprev) < Math.max(W, H) * 0.6) { pred = hs; source = 'sup'; }
+  }
   if (!pred) {
     if (wasLost) { pred = Hprev; source = 'hold'; }
     else if (sbiH && plausible(sbiH)) { pred = sbiH; source = 'sbi'; }
     else { pred = extrapolate(Hprev, st.prevH); source = 'motion'; }
   }
+  if (supOn && !supDone) { const iv = invertH(Hprev); supTrack(source === 'lk' && iv ? mulH(pred, iv) : null); }
   lap('lk');
 
   // релокализация: при потере — по всему кадру; периодически — проверка дрейфа
@@ -1594,7 +1794,7 @@ function track(msg) {
   // Сравнение с шаблоном — самая дорогая часть кадра. На медленном устройстве, когда поток уверенно держит позу
   // (богатая фактура), делаем его не на каждом кадре.
   const lite = !!st.lite;
-  const skipTmpl = lite && source === 'lk' && lkInl >= 30 && !wasLost && !st.fail && !st.lowTex &&
+  const skipTmpl = lite && !st.weakTex && source === 'lk' && lkInl >= 30 && !wasLost && !st.fail && !st.lowTex &&
     !ecc && st.frame % 3 !== 0;
   const pairs = skipTmpl ? { ref: [], cur: [], n: 0, ratio: 0, skipped: true } : templatePairs(pred);
   if (!skipTmpl) st.lowTex = pairs.n < 60;
@@ -1657,11 +1857,12 @@ function track(msg) {
   const nEdges = edges.length;
   // точки шаблона засчитываются, только если совпала заметная их доля (иначе это шум)
   const tmplOk = pairs.n >= CFG.minRefine && (pairs.ratio >= 0.12 || pairs.n >= 30);
+  const sp = supOn ? supPairs(pred) : { ref: [], cur: [] };
   const good = tmplOk || !!ecc || skipTmpl || nEdges >= 3 || (nEdges >= 2 && pairs.n >= 4) ||
-    (!wasLost && lkInl >= 15 && pairs.n >= 4);
+    (!wasLost && lkInl >= 15 && pairs.n >= 4) || sp.ref.length >= SUP.minPose;
   let state = 'lost', rms = 0, accepted = null;
   if (good) {
-    const opt = optimize(pred, pred, pairs, edges);
+    const opt = optimize(pred, pred, sp.ref.length ? { ref: pairs.ref.concat(sp.ref), cur: pairs.cur.concat(sp.cur) } : pairs, edges);
     rms = opt.rms;
     if (plausible(opt.H) && shapeOk(opt.H) && opt.rms < 3) accepted = opt.H;
     else if (ecc && plausible(ecc.H) && shapeOk(ecc.H)) accepted = ecc.H; // оптимизация спорит с плотным выравниванием (мало точек) — верим ему
@@ -1717,6 +1918,7 @@ function track(msg) {
         if (st.keyframes.length > CFG.maxKeyframes) st.keyframes.splice(1, 1)[0].desc.delete(); // исходный храним всегда
       } else kf.desc.delete();
     }
+    if (CFG.sup && st.sup && !st.fullFrame && !st.fail) supUpkeep(st.H);
     const tmp = prevNorm; prevNorm = norm; norm = tmp;
     swapSmall();
     finishEms();
@@ -1727,6 +1929,7 @@ function track(msg) {
     st.lost++;
     st.stable = 0;
     st.cur = new Float32Array(0); st.ref = new Float32Array(0);
+    supReset();
     const tmp = prevNorm; prevNorm = norm; norm = tmp;
     swapSmall();
   }
@@ -1751,11 +1954,14 @@ function track(msg) {
     keyframes: st.keyframes.length,
     source,
     ms: Math.round(now() - tStart),
+    totalMs: st.ems ? Math.round(st.ems) : undefined, // среднее полное время кадра, вместе с обслуживанием после отправки позы
     prof,
     dbgPts: self.DEBUG_PTS ? Array.from(st.cur) : undefined,
     anchors: st.anchors.length ? anchorPositions() : undefined,
     anchorsDropped: anchorsDropped || undefined,
     sbi: st.sbi || undefined, sbiRaw: st.sbiRaw,
+    support: supOut(), sup: sp.ref.length,
+    dbgSup: st.sup ? [st.sup.pts.length, st.sup.pts.filter((p) => p.ok).length, +Math.max(0, ...[...st.sup.batches.values()].map((b) => b.pmax)).toFixed(3)] : undefined,
     dbgEnv: [st.auto ? 1 : 0, st.envBad || 0, st.autoDropped ? 1 : 0, st.fullFrame ? 1 : 0, st.ownN, st.ownModel],
   };
   if (defer) Object.defineProperty(out, 'defer', { value: defer, enumerable: false });
