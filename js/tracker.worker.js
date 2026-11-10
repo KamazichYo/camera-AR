@@ -30,8 +30,7 @@ const CFG = {
   minCorners: 25,
   cornerQuality: 0.006,
   cornerMinDist: 7,
-  lkWin: 15,              // окно потока для цели с богатой фактурой
-  lkWinWeak: 21,          // для слабой фактуры (пустая бумага, кожа): маленькому окну там не за что зацепиться
+  lkWin: 21,              // окно потока (15 px быстрее на ≈ 3 мс, но у целей с малым числом деталей рамка начинает плыть)
   lkLevels: 3,
   fbMaxErr: 1.5,          // px — допустимая ошибка проверки вперёд-назад
   lkBackCheck: false,     // межкадровый поток — только прогноз, RANSAC и шаблон отсеют ошибки
@@ -583,7 +582,7 @@ function lkPairs(imgA, imgB, ptsA, win, levels, backCheck = true, init = null) {
 function trackLK(A) {
   let init = null;
   if (A) { init = new Float32Array(st.cur.length); for (let i = 0; i < init.length; i += 2) { const p = applyH(A, st.cur[i], st.cur[i + 1]); init[i] = p[0]; init[i + 1] = p[1]; } }
-  const lkr = lkPairs(prevNorm, norm, st.cur, st.weakTex ? CFG.lkWinWeak : CFG.lkWin, CFG.lkLevels, CFG.lkBackCheck, init);
+  const lkr = lkPairs(prevNorm, norm, st.cur, CFG.lkWin, CFG.lkLevels, CFG.lkBackCheck, init);
   let idx = lkr.idx, out = lkr.out;
   // точки, попавшие на руку, — не опора: движущаяся рука иначе образует самую большую согласованную группу
   // и RANSAC принимает её движение за движение бумаги
@@ -914,6 +913,7 @@ const SUP = {
   tight: 1.6,       // px: согласие с общей гомографией плоскости
   keep: 2.5,        // px: опора дальше этого от своего места — промах
   alpha: 0.05,      // скорость подстройки опорных координат (усреднение шума позы; медленный дрейф потока)
+  minUse: 8,        // меньше стольких согласных опор — в оценке позы они не участвуют
   minPose: 12,      // столько опор — поза по ним одним, если свой поток холста сорвался
   focal: 0.85,      // фокусное расстояние в долях длинной стороны кадра (основная камера телефона)
 };
@@ -923,7 +923,7 @@ function supOut() {
   if (!st.sup) return undefined;
   const o = [];
   for (const p of st.sup.pts) if (p.ok) o.push([+(p.rx + 0.5).toFixed(1), +(p.ry + 0.5).toFixed(1)]);
-  return o;
+  return o.length >= SUP.minUse ? o : [];
 }
 
 function supReset() { st.sup = { pts: [], batches: new Map(), nextId: 1 }; }
@@ -989,6 +989,8 @@ function supPairs(Hm) {
     const q = applyH(Hm, p.rx, p.ry);
     if (Math.hypot(q[0] - p.x, q[1] - p.y) < 3) { res.ref.push([p.rx, p.ry]); res.cur.push([p.x, p.y]); }
   }
+  // настоящая общая плоскость (стол, стена) даёт десятки опор; несколько штук — случайные совпадения в чужой плоскости
+  if (res.ref.length < SUP.minUse) return { ref: [], cur: [] };
   return res;
 }
 
