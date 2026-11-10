@@ -11,7 +11,7 @@ const { launch, check, DATA, frameIndex, waitFrame } = require('./common.cjs');
     if (!(await p.evaluate(() => document.body.classList.contains('running')))) await p.click('#btn-start');
     await p.waitForFunction(() => document.querySelector('#video').videoWidth > 0, null, { timeout: 20000 });
   };
-  await p.goto(`${url}/app/index.html`);
+  await p.goto(`${url}/app/index.html?rec`);
   await start();
   check(true, 'камера запущена');
 

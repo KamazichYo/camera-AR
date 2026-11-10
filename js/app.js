@@ -24,6 +24,10 @@ const DEFAULTS = {
   quadN: null,
 };
 const S = loadSettings(DEFAULTS);
+// Запись видео пока выключена (включается адресом с ?rec): без неё камере хватает 720p — кадр вдвое с лишним меньше
+// 1080p, его дешевле загружать в видеопамять и показывать, а ресурсы телефона идут на трекинг.
+const REC = new URLSearchParams(location.search).has('rec');
+if (!REC) { S.resolution = '720'; document.body.classList.add('norec'); }
 const DEBUG = { predict: true }; // переключатели для автотестов
 const persist = () => saveSettings(S);
 
@@ -869,7 +873,7 @@ function bind() {
   window.addEventListener('keydown', (e) => {
     if (e.target.matches('input, select, textarea')) return;
     const k = e.key.toLowerCase();
-    if (k === ' ' || k === 'r') { e.preventDefault(); if (document.body.classList.contains('running')) toggleRecord(); }
+    if (REC && (k === ' ' || k === 'r')) { e.preventDefault(); if (document.body.classList.contains('running')) toggleRecord(); }
     else if (k === 'h') $('#btn-eye').click();
     else if (k === 'l') $('#btn-pin').click();
     else if (k === 'a') $('#btn-ar').click();

@@ -282,3 +282,6 @@ input.switch:checked::after { transform: translateX(18px); }
   .rec-btn span { width: 44px; height: 44px; }
   .sheet { bottom: auto; top: calc(var(--safe-t) + 60px); max-height: calc(100% - 150px); }
 }
+
+/* запись выключена: кнопка и её настройки скрыты */
+body.norec #btn-record, body.norec #rec-indicator, body.norec .field:has(#mic), body.norec .field:has(#bitrate), body.norec .field:has(#resolution) { display: none !important; }
