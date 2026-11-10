@@ -532,6 +532,14 @@ function frame(t) {
       svg += '<circle class="anchor-ring" cx="' + x.toFixed(1) + '" cy="' + y.toFixed(1) + '" r="10"/><circle class="anchor-dot" cx="' + x.toFixed(1) + '" cy="' + y.toFixed(1) + '" r="2.5"/>';
     }
   }
+  if (ar.mode === 'tracking' && S.showCanvasFrame && ar.info && ar.info.support && ar.info.support.length) {
+    // автоопоры: неподвижные точки той же плоскости, которые трекер нашёл сам и по которым держит позу
+    const qs = (syncT !== null && sync.quadAt(syncT, ar.info.support)) || applyQuad(ar.H, ar.info.support);
+    for (const p of qs) {
+      const [x, y] = stage.toScreen(p);
+      svg += '<circle class="sup-dot" cx="' + x.toFixed(1) + '" cy="' + y.toFixed(1) + '" r="2.2"/>';
+    }
+  }
   if (ar.mode === 'tracking' && S.showCanvasFrame && ar.refCanvas) {
     const q = canvasQuad || kfCanvas.predict(ar.shownT || t, DEBUG.predict) || applyQuad(ar.H, ar.refCanvas);
     if (isConvexQuad(q)) svg += `<polygon class="canvas-frame ${ar.state}" points="${pts(q)}"/>`;
@@ -548,7 +556,7 @@ function frame(t) {
   // статистика
   if (S.stats && ar.mode === 'tracking' && ar.info) {
     const i = ar.info;
-    $('#stats').textContent = `${tracker.stats.fps} к/с · ${i.ms} мс · точек ${i.points} · inl ${i.inliers} · kf ${i.keyframes} · ${i.source}${sync.active ? ' · показ ' + (sync.glf ? 'GL' : '2D') + ' с задержкой ' + Math.round(sync.delay) + ' мс, кадр ' + sync.bw + '×' + sync.bh + ' (' + (sync.glf ? 'загр. ' + sync.glf.upMs.toFixed(1) + ', чтение ' + sync.glf.readMs.toFixed(1) : sync.grabMs.toFixed(0) + '+' + sync.drawMs.toFixed(0)) + ' мс), экстрапол. ' + sync.extrap + '/' + sync.draws : ''} · анализ ${tracker.procMax}px`;
+    $('#stats').textContent = `${tracker.stats.fps} к/с · ${i.ms} мс · точек ${i.points}+${(i.support || []).length} · inl ${i.inliers} · kf ${i.keyframes} · ${i.source}${sync.active ? ' · показ ' + (sync.glf ? 'GL' : '2D') + ' с задержкой ' + Math.round(sync.delay) + ' мс, кадр ' + sync.bw + '×' + sync.bh + ' (' + (sync.glf ? 'загр. ' + sync.glf.upMs.toFixed(1) + ', чтение ' + sync.glf.readMs.toFixed(1) : sync.grabMs.toFixed(0) + '+' + sync.drawMs.toFixed(0)) + ' мс), экстрапол. ' + sync.extrap + '/' + sync.draws : ''} · анализ ${tracker.procMax}px, ср. ${Math.round(tracker.msAvg || 0)} мс`;
   } else $('#stats').textContent = '';
 
   // таймер записи

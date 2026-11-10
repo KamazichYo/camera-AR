@@ -200,6 +200,7 @@ body.anchoring #ar-dots { display: none; }
 #ar-dots i.on { background: var(--accent); transform: scale(1.2); }
 #ui-layer .anchor-ring { fill: none; stroke: rgba(255, 255, 255, .9); stroke-width: 1.6; filter: drop-shadow(0 0 2px rgba(0, 0, 0, .8)); }
 #ui-layer .anchor-dot { fill: var(--accent); }
+#ui-layer .sup-dot { fill: #6fe3a5; stroke: rgba(0, 0, 0, .55); stroke-width: .8; }
 /* уведомления на время выбора — над кнопками, а не сверху: верх экрана остаётся камере */
 body.selecting #toast, body.anchoring #toast { top: auto; bottom: calc(var(--safe-b) + 150px); }
 #btn-anchor.on { background: var(--accent); color: var(--accent-ink); }

@@ -43,7 +43,7 @@ try {
     } else {
       if (mode === 'track') while (anchors.length && anchors[0].f <= t) { const a = anchors.shift(); row.anchor = (await call({ type: 'addAnchor', point: a.p })).n; }
       const r = await call({ type: 'frame' }, f);
-      row.state = r.state; row.ms = r.ms; row.src = r.source; row.ecc = r.ecc; row.pts = undefined; row.nl = r.points; row.rf = r.refined; row.prof = r.prof; row.edges = r.edges; row.inl = r.inliers; row.rms = r.rms; row.dbg = r.dbgPts; row.env = r.dbgEnv; row.sbi = r.sbi; row.sbiRaw = r.sbiRaw; row.anchors = r.anchors;
+      row.state = r.state; row.ms = r.ms; row.src = r.source; row.ecc = r.ecc; row.pts = undefined; row.nl = r.points; row.rf = r.refined; row.prof = r.prof; row.edges = r.edges; row.inl = r.inliers; row.rms = r.rms; row.dbg = r.dbgPts; row.env = r.dbgEnv; row.sbi = r.sbi; row.sup = r.dbgSup; row.supN = r.sup; row.sbiRaw = r.sbiRaw; row.anchors = r.anchors;
       row.quad = r.H && quad0 ? quad0.map((q) => ap(r.H, q)) : null;
     }
     row.dt = Math.round(performance.now() - t0);

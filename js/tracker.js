@@ -55,6 +55,10 @@ export class ArTracker {
       this.useBitmap = !!r.bitmap && typeof createImageBitmap === 'function';
       this.benchMs = r.bench;
       this.procMax = pickProcMax(r.bench);
+      // замер на синтетике бывает слишком оптимистичным (нагрев, режим энергосбережения): помним размер, подобранный
+      // по настоящим кадрам в прошлый раз
+      try { const m = +localStorage.getItem('artcam.procMax'); if (PROC_LEVELS.includes(m)) this.procMax = Math.min(this.procMax, m); } catch { /* хранилище недоступно */ }
+      this._procCeil = pickProcMax(r.bench);
       return r;
     });
     this.readyPromise.catch(() => { this.readyPromise = null; this.worker.terminate(); this.worker = null; });
@@ -136,6 +140,26 @@ export class ArTracker {
     }
   }
 
+  /**
+   * Подстройка размера кадра анализа по настоящему времени обработки. Менять размер можно только между захватами
+   * (координаты воркера привязаны к размеру), поэтому вызывается перед выбором углов и перед захватом.
+   */
+  _adaptProc() {
+    const ms = this.msAvg;
+    if (!(this._msN >= 30)) return;
+    const i = PROC_LEVELS.indexOf(this.procMax);
+    let L = this.procMax;
+    if (ms > 60) { // время кадра ∝ площади: берём самый большой размер, который уложится примерно в 45 мс
+      const want = this.procMax * Math.sqrt(45 / ms);
+      L = PROC_LEVELS.find((v) => v <= want) || PROC_LEVELS[PROC_LEVELS.length - 1];
+    } else if (ms < 24 && i > 0 && PROC_LEVELS[i - 1] <= (this._procCeil || PROC_LEVELS[0])) L = PROC_LEVELS[i - 1];
+    if (L !== this.procMax) {
+      this.procMax = L;
+      try { localStorage.setItem('artcam.procMax', String(L)); } catch { /* хранилище недоступно */ }
+    }
+    this._msN = 0;
+  }
+
   _toProc(q) { const { sx, sy } = this.proc; return q.map(([x, y]) => [x * sx, y * sy]); }
   _fromProc(q) { const { sx, sy } = this.proc; return q.map(([x, y]) => [x / sx, y / sy]); }
 
@@ -151,6 +175,7 @@ export class ArTracker {
    */
   async selStart() {
     await this.init();
+    this._adaptProc();
     this.running = true;
     this.busy = false;
     await this._send('selStart');
@@ -189,6 +214,7 @@ export class ArTracker {
   /** Начать отслеживание. quad — холст в координатах видео (текущий кадр становится опорным). */
   async lock(quad, { fullFrame = false } = {}) {
     await this.init();
+    this._adaptProc();
     this.running = false;
     const r = await this._send('lock', { quad: this._toProc(quad), fullFrame });
     this.running = true;
@@ -242,6 +268,11 @@ export class ArTracker {
             if (r.type === 'sel') this.onSel && this.onSel(this._selPts(r.pts), !!r.reset);
             else if (r.state !== 'off') {
               this._countFps(r.ms);
+              // полное время кадра вместе с обслуживанием после отправки позы (totalMs приходит с опозданием на кадр)
+              const full = r.totalMs || r.ms;
+              this.msAvg = this._msN ? this.msAvg + 0.06 * (full - this.msAvg) : full;
+              this._msN = (this._msN || 0) + 1;
+              if (r.support) r.support = this._fromProc(r.support);
               this.onPose && this.onPose(this._hToVideo(r.H), r, frameTime);
             }
           }
