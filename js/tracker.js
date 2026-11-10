@@ -31,6 +31,8 @@ export class ArTracker {
     this.seq = 0;
     this.running = false;
     this.busy = false;
+    this.source = null;    // источник кадров (SyncView на пути WebGL): { feeds, latest(), readFrame(f, w, h) }
+    this._lastFrame = null;
     this.onPose = null;    // (H в координатах видео, info) => void
     this.onSel = null;     // (углы выбора [{ p, snapped, feature, lost }], reset) => void
     this.stats = { fps: 0, ms: 0 };
@@ -87,7 +89,19 @@ export class ArTracker {
    * Уменьшенный кадр для воркера. Где можно — ImageBitmap: масштабирование делает
    * браузер (GPU), а чтение пикселей происходит в воркере, не тормозя интерфейс.
    */
+  /** Кадр из общего буфера показа (WebGL), синхронно: тот же кадр, что пойдёт на экран, с его же меткой времени. */
+  _grabShared() {
+    const src = this.source;
+    if (!src || !src.feeds) return null;
+    const { w, h } = this.proc;
+    const f = src.latest();
+    const px = f && src.readFrame(f, w, h);
+    return px ? { msg: { buf: px.buffer, w, h }, transfer: [px.buffer], frame: f } : null;
+  }
+
   async _grab() {
+    const shared = this._grabShared();
+    if (shared) return shared;
     const v = this.video;
     const { w, h } = this.proc;
     if (this.useBitmap) {
@@ -107,8 +121,8 @@ export class ArTracker {
     return { msg: { buf: img.data.buffer, w, h }, transfer: [img.data.buffer] };
   }
 
-  async _send(type, extra = {}) {
-    const f = await this._grab();
+  async _send(type, extra = {}, grabbed = null) {
+    const f = grabbed || await this._grab();
     try {
       return await this._call({ type, ...f.msg, ...extra }, f.transfer);
     } catch (e) {
@@ -203,25 +217,46 @@ export class ArTracker {
       if ('requestVideoFrameCallback' in v) v.requestVideoFrameCallback(tick);
       else requestAnimationFrame(tick);
     };
-    const tick = (nowT, md) => {
+    const tick = (nowT, md, fromSource) => {
       if (!this.running || gen !== this._gen) return;
-      if (this.busy || v.readyState < 2) return next();
+      const again = () => { if (!fromSource) next(); };
+      if (this.busy || v.readyState < 2) return again();
+      const src = this.source && this.source.feeds ? this.source : null;
+      // кадры идут из общего буфера: один и тот же кадр дважды не обрабатываем
+      if (src && (!src.latest() || src.latest() === this._lastFrame)) return again();
+      const shared = src ? this._grabShared() : null;
       this.busy = true;
-      // момент показа этого кадра (та же шкала времени, что у часов показанного кадра в приложении)
-      const frameTime = (md && md.presentationTime) || (typeof nowT === 'number' ? nowT : performance.now());
-      this._send('frame')
+      // момент показа этого кадра: у кадра из общего буфера — его собственная метка, иначе — время обработчика видеокадра
+      const frameTime = shared ? shared.frame.T : (md && md.presentationTime) || (typeof nowT === 'number' ? nowT : performance.now());
+      if (shared) this._lastFrame = shared.frame;
+      const done = () => {
+        this.busy = false;
+        // пока шла обработка, пришёл новый кадр — берём его сразу, не дожидаясь следующего (иначе трекер, который чуть
+        // медленнее камеры, работал бы через кадр)
+        const s2 = this.source;
+        if (this.running && gen === this._gen && s2 && s2.feeds && s2.latest() && s2.latest() !== this._lastFrame) tick(undefined, undefined, true);
+      };
+      this._send('frame', {}, shared)
         .then((r) => {
-          this.busy = false;
-          if (!this.running) return;
-          if (r.type === 'sel') { this.onSel && this.onSel(this._selPts(r.pts), !!r.reset); return; }
-          if (r.state === 'off') return;
-          this._countFps(r.ms);
-          this.onPose && this.onPose(this._hToVideo(r.H), r, frameTime);
+          if (this.running) {
+            if (r.type === 'sel') this.onSel && this.onSel(this._selPts(r.pts), !!r.reset);
+            else if (r.state !== 'off') {
+              this._countFps(r.ms);
+              this.onPose && this.onPose(this._hToVideo(r.H), r, frameTime);
+            }
+          }
+          done();
         })
-        .catch((err) => { this.busy = false; console.warn('AR', err); });
-      next();
+        .catch((err) => { console.warn('AR', err); done(); });
+      again();
     };
+    this._tick = tick;
     next();
+  }
+
+  /** Источник кадров снял новый кадр — берём его в работу сразу, не дожидаясь своего обработчика видеокадра. */
+  kick() {
+    if (this.running && this._tick) this._tick(undefined, undefined, true);
   }
 
   _countFps(ms) {

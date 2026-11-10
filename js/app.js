@@ -34,7 +34,10 @@ const camera = new Camera(video);
 const recorder = new Recorder();
 const ref = new Reference();
 const tracker = new ArTracker(video);
-const sync = new SyncView(video, $('#view'));
+// ?nogl — не использовать WebGL для показа и захвата кадров (запасной путь, для диагностики)
+const sync = new SyncView(video, $('#view'), { gl: !new URLSearchParams(location.search).has('nogl') });
+tracker.source = sync;                  // на пути WebGL трекер берёт кадры из общего буфера показа
+sync.onFrame = () => tracker.kick();
 $('#world').appendChild(ref.canvas);
 
 let overlayQuad = null;            // рамка референса в координатах видео (без AR)
@@ -233,6 +236,8 @@ async function arBegin() {
     $('#toast').classList.remove('show'); // «Загружаю AR-модуль…» больше не нужна
     ar.mode = 'select';
     updateArUi();
+    // общий буфер кадров (WebGL) включается уже на выборе углов: трекер с самого начала видит те же кадры, что пойдут на экран
+    if (S.syncView) sync.start();
     await tracker.selStart(); // камера идёт как обычно; точки, отмеченные касанием, ведутся по кадрам
   } catch (e) {
     console.error(e);
@@ -358,7 +363,7 @@ function onLocked(info) {
   ar.refOverlay = overlayQuad ? overlayQuad.map((p) => [...p]) : null;
   resetSmoothing();
   setFilterSmoothing();
-  if (S.syncView) sync.start();
+  if (S.syncView) { sync.start(); sync.show(); }
   ar.mode = 'tracking';
   updateArUi();
   if (info.weak) {
@@ -539,7 +544,7 @@ function frame(t) {
   // статистика
   if (S.stats && ar.mode === 'tracking' && ar.info) {
     const i = ar.info;
-    $('#stats').textContent = `${tracker.stats.fps} к/с · ${i.ms} мс · точек ${i.points} · inl ${i.inliers} · kf ${i.keyframes} · ${i.source}${sync.active ? ' · показ с задержкой ' + Math.round(sync.delay) + ' мс, кадр ' + sync.bw + '×' + sync.bh + ' (' + sync.grabMs.toFixed(0) + '+' + sync.drawMs.toFixed(0) + ' мс), экстрапол. ' + sync.extrap + '/' + sync.draws : ''} · анализ ${tracker.procMax}px`;
+    $('#stats').textContent = `${tracker.stats.fps} к/с · ${i.ms} мс · точек ${i.points} · inl ${i.inliers} · kf ${i.keyframes} · ${i.source}${sync.active ? ' · показ ' + (sync.glf ? 'GL' : '2D') + ' с задержкой ' + Math.round(sync.delay) + ' мс, кадр ' + sync.bw + '×' + sync.bh + ' (' + (sync.glf ? 'загр. ' + sync.glf.upMs.toFixed(1) + ', чтение ' + sync.glf.readMs.toFixed(1) : sync.grabMs.toFixed(0) + '+' + sync.drawMs.toFixed(0)) + ' мс), экстрапол. ' + sync.extrap + '/' + sync.draws : ''} · анализ ${tracker.procMax}px`;
   } else $('#stats').textContent = '';
 
   // таймер записи
@@ -835,7 +840,7 @@ function bind() {
   $('#sync-view').onchange = (e) => {
     S.syncView = e.target.checked; persist();
     if (ar.mode !== 'tracking') return;
-    if (S.syncView) sync.start();
+    if (S.syncView) { sync.start(); if (ar.mode === 'tracking') sync.show(); }
     else { sync.stop(); document.body.classList.remove('synced'); }
     resetSmoothing();
   };
