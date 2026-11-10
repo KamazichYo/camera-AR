@@ -30,7 +30,8 @@ const CFG = {
   minCorners: 25,
   cornerQuality: 0.006,
   cornerMinDist: 7,
-  lkWin: 15,
+  lkWin: 15,              // окно потока для цели с богатой фактурой
+  lkWinWeak: 21,          // для слабой фактуры (пустая бумага, кожа): маленькому окну там не за что зацепиться
   lkLevels: 3,
   fbMaxErr: 1.5,          // px — допустимая ошибка проверки вперёд-назад
   lkBackCheck: false,     // межкадровый поток — только прогноз, RANSAC и шаблон отсеют ошибки
@@ -582,7 +583,7 @@ function lkPairs(imgA, imgB, ptsA, win, levels, backCheck = true, init = null) {
 function trackLK(A) {
   let init = null;
   if (A) { init = new Float32Array(st.cur.length); for (let i = 0; i < init.length; i += 2) { const p = applyH(A, st.cur[i], st.cur[i + 1]); init[i] = p[0]; init[i + 1] = p[1]; } }
-  const lkr = lkPairs(prevNorm, norm, st.cur, CFG.lkWin, CFG.lkLevels, CFG.lkBackCheck, init);
+  const lkr = lkPairs(prevNorm, norm, st.cur, st.weakTex ? CFG.lkWinWeak : CFG.lkWin, CFG.lkLevels, CFG.lkBackCheck, init);
   let idx = lkr.idx, out = lkr.out;
   // точки, попавшие на руку, — не опора: движущаяся рука иначе образует самую большую согласованную группу
   // и RANSAC принимает её движение за движение бумаги
@@ -1349,7 +1350,8 @@ let skinLo = null, skinHi = null;
 function computeSkin() {
   // считается на уменьшенном вдвое кадре (вчетверо дешевле) и растягивается обратно: маске точность до пикселя не нужна
   const half = new cv.Mat(), rgb = new cv.Mat(), ycc = new cv.Mat(), m2 = new cv.Mat(), m = new cv.Mat();
-  const hw = Math.max(1, W >> 1), hh = Math.max(1, H >> 1);
+  // (на пустой бумаге с рукой граница маски важна до пикселя — там считаем на полном кадре)
+  const sd = st && st.weakTex ? 1 : 2, hw = Math.max(1, Math.round(W / sd)), hh = Math.max(1, Math.round(H / sd));
   cv.resize(rgba, half, new cv.Size(hw, hh), 0, 0, cv.INTER_NEAREST);
   cv.cvtColor(half, rgb, cv.COLOR_RGBA2RGB);
   cv.cvtColor(rgb, ycc, cv.COLOR_RGB2YCrCb);
@@ -1359,7 +1361,7 @@ function computeSkin() {
     skinHi = new cv.Mat(hh, hw, cv.CV_8UC3, new cv.Scalar(255, 178, 128));
   }
   cv.inRange(ycc, skinLo, skinHi, m2);
-  const k = cv.getStructuringElement(cv.MORPH_ELLIPSE, new cv.Size(5, 5));
+  const k = cv.getStructuringElement(cv.MORPH_ELLIPSE, new cv.Size(sd === 1 ? 7 : 5, sd === 1 ? 7 : 5));
   cv.dilate(m2, m2, k);
   cv.resize(m2, m, new cv.Size(W, H), 0, 0, cv.INTER_NEAREST);
   [half, rgb, ycc, m2, k].forEach((x) => x.delete());
@@ -1612,6 +1614,7 @@ function startTracking(quad, msg) {
     initialPts: 0,
     shape0: null,
     ancLow: 0,
+    weakTex: true,
     Hgood: null,
   };
   // маска кожи включается, только если внутри рамки кожи нет (на ладони цель — сама кожа)
@@ -1638,6 +1641,7 @@ function startTracking(quad, msg) {
     }
   }
   st.initialPts = st.cur.length / 2;
+  st.weakTex = !!st.auto || st.initialPts < 60;
   setTemplate(gray, null);
   st.eccOk = st.tmpl.ecc.texStd >= ECC.minTex; // текстура считается один раз — по эталонному кадру (позже в заплатку может попасть рука)
   st.keyframes.push(makeKeyframe(gray, st.H, now()));
@@ -1788,7 +1792,7 @@ function track(msg) {
   // Сравнение с шаблоном — самая дорогая часть кадра. На медленном устройстве, когда поток уверенно держит позу
   // (богатая фактура), делаем его не на каждом кадре.
   const lite = !!st.lite;
-  const skipTmpl = lite && source === 'lk' && lkInl >= 30 && !wasLost && !st.fail && !st.lowTex &&
+  const skipTmpl = lite && !st.weakTex && source === 'lk' && lkInl >= 30 && !wasLost && !st.fail && !st.lowTex &&
     !ecc && st.frame % 3 !== 0;
   const pairs = skipTmpl ? { ref: [], cur: [], n: 0, ratio: 0, skipped: true } : templatePairs(pred);
   if (!skipTmpl) st.lowTex = pairs.n < 60;
@@ -1948,6 +1952,7 @@ function track(msg) {
     keyframes: st.keyframes.length,
     source,
     ms: Math.round(now() - tStart),
+    totalMs: st.ems ? Math.round(st.ems) : undefined, // среднее полное время кадра, вместе с обслуживанием после отправки позы
     prof,
     dbgPts: self.DEBUG_PTS ? Array.from(st.cur) : undefined,
     anchors: st.anchors.length ? anchorPositions() : undefined,

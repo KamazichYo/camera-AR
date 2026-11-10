@@ -19,19 +19,24 @@ const maxErr = (q, g) => Math.max(...q.map((p, i) => Math.hypot(p[0] - g[i][0], 
 (async () => {
   const pts = [[95, 144], [240, 152], [240, 374], [98, 382]];
   const taps = pts.map((p, i) => ({ f: 2 + i * 2, p }));
-  const r = await runVideo({ taps, step: 1, n: 920, port: 8950, dir: '/t/.data/sketch' });
-  if (r.error) { check(false, `скетчбук: ${r.error}`); return; }
-  const lock = r.rows.find((x) => x.locked);
-  const tr = r.rows.filter((x) => x.state);
-  const lost = tr.filter((x) => x.state !== 'tracking').length;
-  const keys = tr.filter((x) => x.quad && ref[x.t]);
-  const errs = keys.map((x) => quadErr(x.quad, ref[x.t])).sort((a, b) => a - b);
-  const worst = keys.reduce((m, x) => Math.max(m, maxErr(x.quad, ref[x.t])), 0);
-  const med = errs[errs.length >> 1];
-  const ms = Math.round(tr.reduce((s, x) => s + (x.ms || 0), 0) / tr.length);
-  check(!!lock, `скетчбук: AR включился после 4-го касания (кадр ${lock && lock.t})`);
-  check(lost === 0, `скетчбук: ${tr.length} кадров, потеряно ${lost}`);
-  check(med < 3 && worst < 12, `скетчбук: по ${keys.length} ключевым кадрам ошибка мед. ${med.toFixed(1)} px, худший угол ${worst.toFixed(1)} px (рука закрывает грани, листание)`);
-  console.log(`  ${ms} мс/кадр`);
-  check(r.errors.length === 0, 'скетчбук: без ошибок в консоли');
+  // облегчённый режим включается по времени кадра, то есть зависит от скорости машины: прогоняем оба варианта явно
+  // (на слабом телефоне он включён постоянно)
+  let port = 8950;
+  for (const [name, liteMs] of [['', 1e9], [' (облегчённый режим)', 0]]) {
+    const r = await runVideo({ taps, step: 1, n: 920, port: port++, dir: '/t/.data/sketch', cfg: { cfg: { liteMs } } });
+    if (r.error) { check(false, `скетчбук${name}: ${r.error}`); continue; }
+    const lock = r.rows.find((x) => x.locked);
+    const tr = r.rows.filter((x) => x.state);
+    const lost = tr.filter((x) => x.state !== 'tracking').length;
+    const keys = tr.filter((x) => x.quad && ref[x.t]);
+    const errs = keys.map((x) => quadErr(x.quad, ref[x.t])).sort((a, b) => a - b);
+    const worst = keys.reduce((m, x) => Math.max(m, maxErr(x.quad, ref[x.t])), 0);
+    const med = errs[errs.length >> 1];
+    const ms = Math.round(tr.reduce((s, x) => s + (x.ms || 0), 0) / tr.length);
+    check(!!lock, `скетчбук${name}: AR включился после 4-го касания (кадр ${lock && lock.t})`);
+    check(lost === 0, `скетчбук${name}: ${tr.length} кадров, потеряно ${lost}`);
+    check(med < 3 && worst < 12, `скетчбук${name}: по ${keys.length} ключевым кадрам ошибка мед. ${med.toFixed(1)} px, худший угол ${worst.toFixed(1)} px (рука закрывает грани, листание)`);
+    console.log(`  ${ms} мс/кадр`);
+    check(r.errors.length === 0, `скетчбук${name}: без ошибок в консоли`);
+  }
 })().catch((e) => { console.error(e); process.exit(1); });

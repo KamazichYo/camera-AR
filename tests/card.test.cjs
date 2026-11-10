@@ -51,6 +51,12 @@ const RUNS = [
     check(lost === 0, `карта, ${name}: ${tr.length} кадров, потеряно ${lost}`);
     check(med <= medTol && max <= maxTol, `карта, ${name}: ошибка худшего угла мед. ${med.toFixed(2)} px, 90% ${q(errs, 0.9).toFixed(2)} px, макс. ${max.toFixed(2)} px (допуск ${medTol}/${maxTol}); ` +
       `дрожь мед. ${q(jit, 0.5).toFixed(2)} px; ${ms} мс/кадр`);
+    if (step === 1) {
+      // автоопоры: трекер сам находит на столе точки той же плоскости и держит по ним позу
+      const ok = tr.map((x) => (x.sup ? x.sup[1] : 0));
+      const withSup = ok.filter((v) => v >= 8).length;
+      check(withSup >= 0.5 * tr.length, `карта, ${name}: автоопоры на столе найдены — кадров с ≥ 8 опорами ${withSup} из ${tr.length}, макс. ${Math.max(...ok)}`);
+    }
     check(r.errors.length === 0, `карта, ${name}: без ошибок в консоли`);
   }
 })().catch((e) => { console.error(e); process.exit(1); });
