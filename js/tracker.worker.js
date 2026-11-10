@@ -453,8 +453,7 @@ function dropState() {
   if (st.eccRecent) st.eccRecent.delete();
   if (st.skin) st.skin.delete();
   if (st.validFrame) st.validFrame.m.delete();
-  if (st.prevFree) st.prevFree.delete();
-  st.tmpl = null; st.eccRecent = null; st.skin = null; st.validFrame = null; st.prevFree = null;
+  st.tmpl = null; st.eccRecent = null; st.skin = null; st.validFrame = null;
 }
 
 /** Сопоставление ORB текущего кадра с ключевыми кадрами. */
@@ -641,47 +640,30 @@ function trackLK(A) {
 // SBI.side) смаза почти не замечает, а сдвиг в нём — считанные пиксели. Ищем в нём область цели из прошлого кадра
 // (нормированная корреляция) — получаем грубый сдвиг; поток стартует уже от него. Приём известен по PTAM
 // (Klein & Murray, «small blurry image»).
-const SBI = { side: 72, minScore: 0.7, minTarget: 0.7, minStd: 5, maxFrac: 0.62, ambig: 0.06 };
+const SBI = { side: 72, minScore: 0.9, minTarget: 0.9, maxAniso: 1.18, minStd: 5, maxFrac: 0.62, ambig: 0.06 };
 
 function makeSmall() {
   smallK = SBI.side / Math.max(W, H);
   cv.resize(gray, small, new cv.Size(Math.max(8, Math.round(W * smallK)), Math.max(8, Math.round(H * smallK))), 0, 0, cv.INTER_AREA);
   cv.GaussianBlur(small, small, new cv.Size(3, 3), 0);
 }
-function swapSmall() {
-  const t = prevSmall; prevSmall = small; small = t;
-  if (st) { if (st.prevFree) st.prevFree.delete(); st.prevFree = skinFreeSmall(); }
-}
-
-/** Маска «не кожа» текущего кадра в масштабе маленького кадра: рука двигается сама по себе и не должна вести оценку. */
-function skinFreeSmall() {
-  if (!st || !st.skinOn || !st.skin || small.empty() && prevSmall.empty()) return null;
-  const ref = prevSmall.empty() ? small : prevSmall;
-  const m = new cv.Mat();
-  cv.resize(st.skin, m, new cv.Size(ref.cols, ref.rows), 0, 0, cv.INTER_AREA);
-  cv.threshold(m, m, 40, 255, cv.THRESH_BINARY_INV);
-  return m;
-}
+function swapSmall() { const t = prevSmall; prevSmall = small; small = t; }
 
 /** Где область (rx, ry, rw, rh) прошлого маленького кадра находится в текущем: пик нормированной корреляции и его однозначность. */
 function sbiMatch(rx, ry, rw, rh) {
   const rect = new cv.Rect(rx, ry, rw, rh);
   const tpl = prevSmall.roi(rect);
-  const pf = st.prevFree && st.prevFree.cols === prevSmall.cols && st.prevFree.rows === prevSmall.rows ? st.prevFree : null;
-  let mask = pf ? pf.roi(rect) : null;
-  if (mask && cv.countNonZero(mask) < 0.3 * rw * rh) { mask.delete(); mask = null; tpl.delete(); return null; } // образец закрыт рукой
-  if (mask && cv.countNonZero(mask) === rw * rh) { mask.delete(); mask = null; }
-  const done = (v) => { tpl.delete(); if (mask) mask.delete(); return v; };
+  const done = (v) => { tpl.delete(); return v; };
   const mean = new cv.Mat(), sd = new cv.Mat();
-  if (mask) cv.meanStdDev(tpl, mean, sd, mask); else cv.meanStdDev(tpl, mean, sd);
+  cv.meanStdDev(tpl, mean, sd);
   const std = sd.data64F[0];
   mean.delete(); sd.delete();
   if (std < SBI.minStd) return done(null); // гладко — корреляция ничего не скажет
   const res = new cv.Mat();
-  if (mask) cv.matchTemplate(small, tpl, res, cv.TM_CCOEFF_NORMED, mask); else cv.matchTemplate(small, tpl, res, cv.TM_CCOEFF_NORMED);
+  cv.matchTemplate(small, tpl, res, cv.TM_CCOEFF_NORMED);
   const R = res.data32F, cw = res.cols, ch = res.rows;
   let bi = -1;
-  for (let i = 0; i < R.length; i++) if (R[i] <= 1.001 && (bi < 0 || R[i] > R[bi])) bi = i; // (с маской на гладком месте бывает NaN/inf)
+  for (let i = 0; i < R.length; i++) if (Number.isFinite(R[i]) && (bi < 0 || R[i] > R[bi])) bi = i;
   if (bi < 0) { res.delete(); return done(null); }
   const px = bi % cw, py = (bi / cw) | 0, score = R[bi];
   // однозначность: вдали от пика не должно быть почти такого же совпадения (полосатая фактура, повторяющийся узор)
@@ -690,7 +672,7 @@ function sbiMatch(rx, ry, rw, rh) {
   for (let y = 0; y < ch; y++) for (let x = 0; x < cw; x++) {
     if (Math.abs(x - px) <= ex && Math.abs(y - py) <= ex) continue;
     const v = R[y * cw + x];
-    if (v <= 1.001 && v > second) second = v;
+    if (v > second) second = v;
   }
   res.delete();
   const ok = score >= 0.6 && score - second >= SBI.ambig;
@@ -724,24 +706,21 @@ function coarseShift(Hprev) {
   if (m && m.ok) { dx = m.px - rx; dy = m.py - ry; } else if (g && g.ok) { dx = g.px - gx; dy = g.py - gy; }
   st.sbiRaw = [Math.round(dx / k), Math.round(dy / k), m ? +m.score.toFixed(2) : -1, g ? +g.score.toFixed(2) : -1];
   // аффинное движение середины кадра — плотным выравниванием от стартового сдвига
-  // (кожа исключается: рука над листом двигается сама по себе)
-  const pf = st.prevFree && st.prevFree.cols === sw && st.prevFree.rows === sh ? st.prevFree : null;
-  const cf = pf ? skinFreeSmall() : null;
-  if (pf) {
-    const c = pf.roi(new cv.Rect(gx, gy, gw, gh)), n = cv.countNonZero(c);
-    c.delete();
-    if (n < 0.15 * gw * gh) { cf.delete(); return null; } // почти вся середина кадра — «кожа»: выравнивать нечем
-  }
   const tpl = prevSmall.roi(new cv.Rect(gx, gy, gw, gh));
   const C = cv.matFromArray(2, 3, cv.CV_32F, [1, 0, gx + dx, 0, 1, gy + dy]);
   let cc = -1;
-  try { cc = cv.findTransformECC(tpl, small, C, cv.MOTION_AFFINE, new cv.TermCriteria(3, 40, 1e-3), cf || new cv.Mat(), 5); } catch (err) { cc = -1; }
+  try { cc = cv.findTransformECC(tpl, small, C, cv.MOTION_AFFINE, new cv.TermCriteria(3, 40, 1e-3), new cv.Mat(), 5); } catch (err) { cc = -1; }
   const a = Array.from(C.data32F);
   C.delete(); tpl.delete();
-  if (cf) cf.delete();
   st.sbiRaw.push(+cc.toFixed(2));
+  // движение камеры за несколько кадров на маленьком кадре — почти подобие (сдвиг, поворот, масштаб). Сильный перекос
+  // или разный масштаб по осям значит, что выравнивание «объяснило» перемену в кадре (вошла рука), а не движение
   const det = a[0] * a[4] - a[1] * a[3];
-  if (!(cc >= SBI.minScore) || !(det > 0.5 && det < 2)) return null;
+  const fro = a[0] * a[0] + a[1] * a[1] + a[3] * a[3] + a[4] * a[4];
+  const disc = Math.sqrt(Math.max(0, fro * fro - 4 * det * det));
+  const s1 = Math.sqrt((fro + disc) / 2), s2 = Math.sqrt(Math.max(1e-9, (fro - disc) / 2));
+  st.sbiRaw.push(+(s1 / s2).toFixed(2));
+  if (!(cc >= SBI.minScore) || !(det > 0.5 && det < 2) || s1 / s2 > SBI.maxAniso) return null;
   // a: координаты образца (середина прошлого кадра) → текущий маленький кадр. В координатах маленького кадра: p' = M·p
   const M = [a[0], a[1], a[2] - a[0] * gx - a[1] * gy, a[3], a[4], a[5] - a[3] * gx - a[4] * gy];
   // то же движение должно объяснять и область цели: текущий кадр, приведённый к прошлому, сравниваем с прошлым
@@ -751,12 +730,8 @@ function coarseShift(Hprev) {
     cv.warpAffine(small, back, Mm, new cv.Size(sw, sh), cv.INTER_LINEAR | cv.WARP_INVERSE_MAP, cv.BORDER_REPLICATE);
     const rect = new cv.Rect(rx, ry, rw, rh);
     const r1 = back.roi(rect), r0 = prevSmall.roi(rect);
-    let tm = pf ? pf.roi(rect) : null;
-    if (tm && cv.countNonZero(tm) < 0.3 * rw * rh) { tm.delete(); tm = null; }
-    if (tm) cv.matchTemplate(r1, r0, res, cv.TM_CCOEFF_NORMED, tm); else cv.matchTemplate(r1, r0, res, cv.TM_CCOEFF_NORMED);
+    cv.matchTemplate(r1, r0, res, cv.TM_CCOEFF_NORMED);
     tScore = res.data32F[0];
-    if (!(tScore <= 1.001)) tScore = 0;
-    if (tm) tm.delete();
     r1.delete(); r0.delete(); Mm.delete(); back.delete(); res.delete();
     st.sbiRaw.push(+tScore.toFixed(2));
     if (!(tScore >= SBI.minTarget)) return null;

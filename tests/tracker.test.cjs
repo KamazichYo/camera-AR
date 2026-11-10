@@ -17,7 +17,7 @@ const SCENES = {
 
 async function run(scene, port) {
   const { page, errors, close, url } = await launch({ port });
-  await page.goto(`${url}/t/tracker-harness.html?scene=${scene}`);
+  await page.goto(`${url}/t/tracker-harness.html?scene=${scene}${process.env.CFG ? '&cfg=' + encodeURIComponent(process.env.CFG) : ''}`);
   await page.waitForFunction(() => window.result, null, { timeout: 300000 });
   const r = await page.evaluate(() => window.result);
   await close();
