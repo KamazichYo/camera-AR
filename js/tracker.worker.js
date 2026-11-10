@@ -23,6 +23,8 @@
 'use strict';
 
 const CFG = {
+  sbi: true,              // грубое предсказание движения по маленькому кадру (см. coarseShift)
+  sbiMinMove: 12,         // px: меньшее движение поток находит сам
   maxCorners: 160,
   minCorners: 25,
   cornerQuality: 0.006,
@@ -76,6 +78,7 @@ let ready = false;
 let W = 0, H = 0;
 let rgba = null, gray = null, norm = null, prevNorm = null;
 let F32 = null, MU = null, D = null, V = null;
+let small = null, prevSmall = null, smallK = 1; // маленький размытый кадр (см. coarseShift)
 let orb = null, matcher = null;
 let offscreen = null, offctx = null;
 let st = null; // состояние трекинга
@@ -118,7 +121,8 @@ async function loadCv(urls) {
 // ---------- кадр ----------
 function ensureBuffers(w, h) {
   if (w === W && h === H && gray) return;
-  [rgba, gray, norm, prevNorm, F32, MU, D, V].forEach((m) => m && m.delete());
+  [rgba, gray, norm, prevNorm, F32, MU, D, V, small, prevSmall].forEach((m) => m && m.delete());
+  small = new cv.Mat(); prevSmall = new cv.Mat();
   W = w; H = h;
   rgba = new cv.Mat(h, w, cv.CV_8UC4);
   gray = new cv.Mat(h, w, cv.CV_8UC1);
@@ -548,16 +552,18 @@ function relocalizeByShape(Hlast) {
 
 // ---------- оптический поток ----------
 /** Пирамидальный LK с проверкой вперёд-назад. Возвращает индексы и новые координаты надёжных точек. */
-function lkPairs(imgA, imgB, ptsA, win, levels, backCheck = true) {
+function lkPairs(imgA, imgB, ptsA, win, levels, backCheck = true, init = null) {
   const n = ptsA.length / 2;
   const idx = [], out = [];
   if (n < 1) return { idx, out };
   const p0 = cv.matFromArray(n, 1, cv.CV_32FC2, ptsA);
-  const p1 = new cv.Mat(), pb = new cv.Mat();
+  // init — где ждать точки в imgB (грубое предсказание): поток стартует оттуда, и большой сдвиг кадра ему не помеха
+  const p1 = init ? cv.matFromArray(n, 1, cv.CV_32FC2, init) : new cv.Mat(), pb = new cv.Mat();
   const s1 = new cv.Mat(), s2 = new cv.Mat(), e1 = new cv.Mat(), e2 = new cv.Mat();
   const size = new cv.Size(win, win);
   const crit = new cv.TermCriteria(cv.TERM_CRITERIA_EPS | cv.TERM_CRITERIA_COUNT, 20, 0.03);
-  cv.calcOpticalFlowPyrLK(imgA, imgB, p0, p1, s1, e1, size, levels, crit);
+  if (init) cv.calcOpticalFlowPyrLK(imgA, imgB, p0, p1, s1, e1, size, levels, crit, cv.OPTFLOW_USE_INITIAL_FLOW, 1e-4);
+  else cv.calcOpticalFlowPyrLK(imgA, imgB, p0, p1, s1, e1, size, levels, crit);
   if (backCheck) cv.calcOpticalFlowPyrLK(imgB, imgA, p1, pb, s2, e2, size, levels, crit);
   const a = p0.data32F, b = p1.data32F, c = backCheck ? pb.data32F : null;
   for (let i = 0; i < n; i++) {
@@ -572,8 +578,10 @@ function lkPairs(imgA, imgB, ptsA, win, levels, backCheck = true) {
 }
 
 /** Межкадровый трекинг: быстрый прогноз позы. */
-function trackLK() {
-  const lkr = lkPairs(prevNorm, norm, st.cur, CFG.lkWin, CFG.lkLevels, CFG.lkBackCheck);
+function trackLK(A) {
+  let init = null;
+  if (A) { init = new Float32Array(st.cur.length); for (let i = 0; i < init.length; i += 2) { const p = applyH(A, st.cur[i], st.cur[i + 1]); init[i] = p[0]; init[i + 1] = p[1]; } }
+  const lkr = lkPairs(prevNorm, norm, st.cur, CFG.lkWin, CFG.lkLevels, CFG.lkBackCheck, init);
   let idx = lkr.idx, out = lkr.out;
   // точки, попавшие на руку, — не опора: движущаяся рука иначе образует самую большую согласованную группу
   // и RANSAC принимает её движение за движение бумаги
@@ -623,7 +631,132 @@ function trackLK() {
     keepCur.push(out[i * 2], out[i * 2 + 1]);
     keepGrp.push(grp[i]);
   }
-  return { H: r.H, inliers: r.inliers, ref: keepRef, cur: keepCur, grp: keepGrp };
+  return { H: r.H, inliers: r.inliers, ref: keepRef, cur: keepCur, grp: keepGrp, tried: st.cur.length / 2 };
+}
+
+// ---------- грубое предсказание по маленькому кадру ----------
+// Рывок камеры (или редкие кадры на медленном телефоне) сдвигает картинку на десятки пикселей, да ещё со смазом: поток
+// по точкам до такого сдвига не дотягивается и «находит» ложное движение. Маленький размытый кадр (длинная сторона
+// SBI.side) смаза почти не замечает, а сдвиг в нём — считанные пиксели. Ищем в нём область цели из прошлого кадра
+// (нормированная корреляция) — получаем грубый сдвиг; поток стартует уже от него. Приём известен по PTAM
+// (Klein & Murray, «small blurry image»).
+const SBI = { side: 72, minScore: 0.9, minTarget: 0.9, maxAniso: 1.18, minStd: 5, maxFrac: 0.62, ambig: 0.06 };
+
+function makeSmall() {
+  smallK = SBI.side / Math.max(W, H);
+  cv.resize(gray, small, new cv.Size(Math.max(8, Math.round(W * smallK)), Math.max(8, Math.round(H * smallK))), 0, 0, cv.INTER_AREA);
+  cv.GaussianBlur(small, small, new cv.Size(3, 3), 0);
+}
+function swapSmall() { const t = prevSmall; prevSmall = small; small = t; }
+
+/** Где область (rx, ry, rw, rh) прошлого маленького кадра находится в текущем: пик нормированной корреляции и его однозначность. */
+function sbiMatch(rx, ry, rw, rh) {
+  const rect = new cv.Rect(rx, ry, rw, rh);
+  const tpl = prevSmall.roi(rect);
+  const done = (v) => { tpl.delete(); return v; };
+  const mean = new cv.Mat(), sd = new cv.Mat();
+  cv.meanStdDev(tpl, mean, sd);
+  const std = sd.data64F[0];
+  mean.delete(); sd.delete();
+  if (std < SBI.minStd) return done(null); // гладко — корреляция ничего не скажет
+  const res = new cv.Mat();
+  cv.matchTemplate(small, tpl, res, cv.TM_CCOEFF_NORMED);
+  const R = res.data32F, cw = res.cols, ch = res.rows;
+  let bi = -1;
+  for (let i = 0; i < R.length; i++) if (Number.isFinite(R[i]) && (bi < 0 || R[i] > R[bi])) bi = i;
+  if (bi < 0) { res.delete(); return done(null); }
+  const px = bi % cw, py = (bi / cw) | 0, score = R[bi];
+  // однозначность: вдали от пика не должно быть почти такого же совпадения (полосатая фактура, повторяющийся узор)
+  const ex = Math.max(3, Math.round(0.3 * Math.min(rw, rh)));
+  let second = -1;
+  for (let y = 0; y < ch; y++) for (let x = 0; x < cw; x++) {
+    if (Math.abs(x - px) <= ex && Math.abs(y - py) <= ex) continue;
+    const v = R[y * cw + x];
+    if (v > second) second = v;
+  }
+  res.delete();
+  const ok = score >= 0.6 && score - second >= SBI.ambig;
+  return done({ px, py, score, second, std, ok });
+}
+
+/**
+ * Грубое движение между прошлым и текущим кадром: { A (аффинное, координаты кадра анализа), score } или null.
+ * Определяется только когда вся сцена двигается как целое (двигается камера): одно аффинное преобразование должно
+ * объяснять и середину кадра, и область цели. Если цель двигается отдельно от фона (лист двигают, ладонь) или над
+ * ней ходит рука — такого преобразования нет, и предсказания нет: дальше всё работает как без него.
+ */
+function coarseShift(Hprev) {
+  if (prevSmall.empty() || prevSmall.cols !== small.cols || prevSmall.rows !== small.rows) return null;
+  const sw = small.cols, sh = small.rows, k = smallK;
+  const gx = Math.round(sw * 0.2), gy = Math.round(sh * 0.2), gw = Math.round(sw * 0.6), gh = Math.round(sh * 0.6);
+  // область цели в прошлом кадре (с небольшим запасом: граница «лист/стол» — самая заметная структура)
+  const q = mapQuad(Hprev, st.quad).map(([x, y]) => [x * k, y * k]);
+  let x0 = Math.max(0, Math.min(...q.map((p) => p[0])) - 1.5), x1 = Math.min(sw, Math.max(...q.map((p) => p[0])) + 1.5);
+  let y0 = Math.max(0, Math.min(...q.map((p) => p[1])) - 1.5), y1 = Math.min(sh, Math.max(...q.map((p) => p[1])) + 1.5);
+  const own = x1 - x0 >= 8 && y1 - y0 >= 8; // цель видна
+  // образец не больше доли кадра: иначе ему некуда сдвигаться
+  const mw = sw * SBI.maxFrac, mh = sh * SBI.maxFrac;
+  if (x1 - x0 > mw) { const c = (x0 + x1) / 2; x0 = Math.max(0, Math.min(sw - mw, c - mw / 2)); x1 = x0 + mw; }
+  if (y1 - y0 > mh) { const c = (y0 + y1) / 2; y0 = Math.max(0, Math.min(sh - mh, c - mh / 2)); y1 = y0 + mh; }
+  const rx = Math.floor(x0), ry = Math.floor(y0), rw = Math.min(sw - rx, Math.ceil(x1 - x0)), rh = Math.min(sh - ry, Math.ceil(y1 - y0));
+  // стартовый сдвиг: по области цели, иначе по середине кадра, иначе нулевой
+  const m = own ? sbiMatch(rx, ry, rw, rh) : null;
+  const g = m && m.ok ? null : sbiMatch(gx, gy, gw, gh);
+  let dx = 0, dy = 0;
+  if (m && m.ok) { dx = m.px - rx; dy = m.py - ry; } else if (g && g.ok) { dx = g.px - gx; dy = g.py - gy; }
+  st.sbiRaw = [Math.round(dx / k), Math.round(dy / k), m ? +m.score.toFixed(2) : -1, g ? +g.score.toFixed(2) : -1];
+  // аффинное движение середины кадра — плотным выравниванием от стартового сдвига
+  const tpl = prevSmall.roi(new cv.Rect(gx, gy, gw, gh));
+  const C = cv.matFromArray(2, 3, cv.CV_32F, [1, 0, gx + dx, 0, 1, gy + dy]);
+  let cc = -1;
+  try { cc = cv.findTransformECC(tpl, small, C, cv.MOTION_AFFINE, new cv.TermCriteria(3, 40, 1e-3), new cv.Mat(), 5); } catch (err) { cc = -1; }
+  const a = Array.from(C.data32F);
+  C.delete(); tpl.delete();
+  st.sbiRaw.push(+cc.toFixed(2));
+  // движение камеры за несколько кадров на маленьком кадре — почти подобие (сдвиг, поворот, масштаб). Сильный перекос
+  // или разный масштаб по осям значит, что выравнивание «объяснило» перемену в кадре (вошла рука), а не движение
+  const det = a[0] * a[4] - a[1] * a[3];
+  const fro = a[0] * a[0] + a[1] * a[1] + a[3] * a[3] + a[4] * a[4];
+  const disc = Math.sqrt(Math.max(0, fro * fro - 4 * det * det));
+  const s1 = Math.sqrt((fro + disc) / 2), s2 = Math.sqrt(Math.max(1e-9, (fro - disc) / 2));
+  st.sbiRaw.push(+(s1 / s2).toFixed(2));
+  if (!(cc >= SBI.minScore) || !(det > 0.5 && det < 2) || s1 / s2 > SBI.maxAniso) return null;
+  // a: координаты образца (середина прошлого кадра) → текущий маленький кадр. В координатах маленького кадра: p' = M·p
+  const M = [a[0], a[1], a[2] - a[0] * gx - a[1] * gy, a[3], a[4], a[5] - a[3] * gx - a[4] * gy];
+  // то же движение должно объяснять и область цели: текущий кадр, приведённый к прошлому, сравниваем с прошлым
+  let tScore = 1;
+  if (own && rw >= 6 && rh >= 6) {
+    const Mm = cv.matFromArray(2, 3, cv.CV_64F, M), back = new cv.Mat(), res = new cv.Mat();
+    cv.warpAffine(small, back, Mm, new cv.Size(sw, sh), cv.INTER_LINEAR | cv.WARP_INVERSE_MAP, cv.BORDER_REPLICATE);
+    const rect = new cv.Rect(rx, ry, rw, rh);
+    const r1 = back.roi(rect), r0 = prevSmall.roi(rect);
+    cv.matchTemplate(r1, r0, res, cv.TM_CCOEFF_NORMED);
+    tScore = res.data32F[0];
+    r1.delete(); r0.delete(); Mm.delete(); back.delete(); res.delete();
+    st.sbiRaw.push(+tScore.toFixed(2));
+    if (!(tScore >= SBI.minTarget)) return null;
+  }
+  // маленький кадр → кадр анализа
+  const A = [M[0], M[1], M[2] / k, M[3], M[4], M[5] / k, 0, 0, 1];
+  return { A, score: Math.min(cc, tScore), tol: 2 / k };
+}
+
+/**
+ * Насколько вид цели по позе Hm похож на её вид в прошлом кадре («свежая» заплатка): нормированная корреляция.
+ * Независимая проверка позы: какая из двух спорящих оценок лучше объясняет картинку.
+ */
+function patchScore(Hm) {
+  const e = st.tmpl && st.tmpl.ecc;
+  if (!e || !st.eccRecent) return 0;
+  const { box } = e, s = box.s;
+  const Tfi = invertH([s, 0, -box.x0 * s, 0, s, -box.y0 * s, 0, 0, 1]);
+  const Hmat = cv.matFromArray(3, 3, cv.CV_64F, mulH(Hm, Tfi));
+  const U = new cv.Mat(), res = new cv.Mat();
+  cv.warpPerspective(gray, U, Hmat, new cv.Size(box.w, box.h), cv.INTER_LINEAR | cv.WARP_INVERSE_MAP, cv.BORDER_REPLICATE);
+  cv.matchTemplate(U, st.eccRecent, res, cv.TM_CCOEFF_NORMED);
+  const v = res.data32F[0];
+  Hmat.delete(); U.delete(); res.delete();
+  return Number.isFinite(v) ? v : 0;
 }
 
 /** Засеять точки для оптического потока в текущем кадре по позе Hm. */
@@ -1325,6 +1458,7 @@ function startTracking(quad, msg) {
   st.keyframes.push(makeKeyframe(gray, st.H, now()));
   updateRecentEcc();
   norm.copyTo(prevNorm);
+  makeSmall(); swapSmall();
   const kf = st.keyframes[0];
   const goodEdges = st.edges.filter((e) => e.use).length;
   return {
@@ -1349,6 +1483,7 @@ function track(msg) {
 
   loadFrame(msg);
   normalize(gray, norm);
+  makeSmall();
   st.frame++;
   if (st.skinOn) { if (st.skin) st.skin.delete(); st.skin = computeSkin(); }
   lap('prep');
@@ -1356,9 +1491,30 @@ function track(msg) {
   const Hprev = st.H;
   const wasLost = st.lost > 0;
   let pred = null, source = 'lk', lkInl = 0;
+  // грубый сдвиг цели по маленькому кадру: старт для потока и независимая оценка, с которой поток сверяется
+  let sbi = wasLost || !CFG.sbi ? null : coarseShift(Hprev);
+  let sbiH = sbi ? mulH(sbi.A, Hprev) : null;
+  const sbiMove = sbi ? quadDist(sbiH, Hprev) : 0;
+  // малое движение поток берёт сам, и точнее: грубая оценка нужна только для рывков
+  if (sbi && sbiMove < CFG.sbiMinMove) { sbi = null; sbiH = null; }
+  st.sbi = sbi ? [+sbiMove.toFixed(1), +sbi.score.toFixed(2)] : null;
   if (!wasLost && st.cur.length) {
-    const lk = trackLK();
-    if (lk && quadDist(lk.H, Hprev) < Math.max(W, H) * 0.25) {
+    // обычный поток (без подсказки) — как всегда; грубая оценка подключается, только когда он не справился или спорит с ней
+    let lk = trackLK(null);
+    if (lk && !(quadDist(lk.H, Hprev) < Math.max(W, H) * (sbi ? 0.6 : 0.25))) lk = null;
+    // поток «не справился»: позы нет или он растерял большинство точек (смаз, сдвиг больше его досягаемости)
+    const weak = !lk || lk.inliers < 0.5 * lk.tried;
+    if (sbi && weak && (!lk || quadDist(lk.H, sbiH) > sbi.tol + 0.15 * sbiMove)) {
+      // рывок камеры: пробуем поток ещё раз — от грубой оценки — и из двух поз берём ту, по которой цель больше
+      // похожа на себя в прошлом кадре
+      let lk2 = trackLK(sbi.A);
+      if (lk2 && !(quadDist(lk2.H, sbiH) < sbi.tol + 0.3 * sbiMove)) lk2 = null;
+      const s0 = lk ? patchScore(lk.H) : -1, s2 = lk2 ? patchScore(lk2.H) : -1, sS = patchScore(sbiH);
+      st.sbi.push(+s0.toFixed(2), +s2.toFixed(2), +sS.toFixed(2));
+      if (lk2 && s2 > s0 + 0.03) lk = lk2;
+      else if (lk && s0 < sS - 0.1) lk = null; // слабый поток объясняет картинку заметно хуже грубой оценки
+    }
+    if (lk) {
       pred = lk.H;
       st.cur = Float32Array.from(lk.cur);
       st.ref = Float32Array.from(lk.ref);
@@ -1368,7 +1524,11 @@ function track(msg) {
       st.cur = new Float32Array(0); st.ref = new Float32Array(0);
     }
   }
-  if (!pred) { pred = wasLost ? Hprev : extrapolate(Hprev, st.prevH); source = wasLost ? 'hold' : 'motion'; }
+  if (!pred) {
+    if (wasLost) { pred = Hprev; source = 'hold'; }
+    else if (sbiH && plausible(sbiH)) { pred = sbiH; source = 'sbi'; }
+    else { pred = extrapolate(Hprev, st.prevH); source = 'motion'; }
+  }
   lap('lk');
 
   // релокализация: при потере — по всему кадру; периодически — проверка дрейфа
@@ -1558,6 +1718,7 @@ function track(msg) {
       } else kf.desc.delete();
     }
     const tmp = prevNorm; prevNorm = norm; norm = tmp;
+    swapSmall();
     finishEms();
   };
   let defer = null;
@@ -1567,6 +1728,7 @@ function track(msg) {
     st.stable = 0;
     st.cur = new Float32Array(0); st.ref = new Float32Array(0);
     const tmp = prevNorm; prevNorm = norm; norm = tmp;
+    swapSmall();
   }
   if (!defer) finishEms();
   if (defer && self.DEBUG_NO_DEFER) { defer(); defer = null; }
@@ -1593,6 +1755,7 @@ function track(msg) {
     dbgPts: self.DEBUG_PTS ? Array.from(st.cur) : undefined,
     anchors: st.anchors.length ? anchorPositions() : undefined,
     anchorsDropped: anchorsDropped || undefined,
+    sbi: st.sbi || undefined, sbiRaw: st.sbiRaw,
     dbgEnv: [st.auto ? 1 : 0, st.envBad || 0, st.autoDropped ? 1 : 0, st.fullFrame ? 1 : 0, st.ownN, st.ownModel],
   };
   if (defer) Object.defineProperty(out, 'defer', { value: defer, enumerable: false });
@@ -2231,6 +2394,7 @@ self.onmessage = async (e) => {
     if (msg.type === 'lock') res = lock(msg);
     else if (msg.type === 'frame') res = sel ? selFrame(msg) : track(msg);
     else if (msg.type === 'debugPts') { self.DEBUG_PTS = true; res = { type: 'ok' }; }
+    else if (msg.type === 'debugCfg') { Object.assign(CFG, msg.cfg || {}); Object.assign(ECC, msg.ecc || {}); res = { type: 'ok' }; } // тесты: подмена параметров
     else if (msg.type === 'debugMinMs') { self.DEBUG_MIN_MS = msg.ms; res = { type: 'ok' }; }
     else if (msg.type === 'debugJitterMs') { self.DEBUG_JITTER_MS = msg.ms; res = { type: 'ok' }; }
     else if (msg.type === 'selStart') res = selStart(msg);

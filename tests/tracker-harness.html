@@ -18,6 +18,7 @@ async function frame(t) {
 const ap = (H, [x, y]) => { const w = H[6] * x + H[7] * y + H[8]; return [(H[0] * x + H[1] * y + H[2]) / w, (H[3] * x + H[4] * y + H[5]) / w]; };
 try {
   await call({ type: 'init', urls: [CV] });
+  if (P.get('cfg')) await call({ type: 'debugCfg', ...JSON.parse(P.get('cfg')) });
   let buf = await frame(0);
   const det = await call({ type: 'detect', buf, w: 640, h: 360 }, [buf]);
   const q0 = gt[0].q;
@@ -29,7 +30,7 @@ try {
     const r = await call({ type: 'frame', buf, w: 640, h: 360 }, [buf]);
     const q = q0.map((p) => ap(r.H, p));
     const err = q.reduce((s, p, i) => s + Math.hypot(p[0] - gt[t].q[i][0], p[1] - gt[t].q[i][1]), 0) / 4;
-    rows.push({ t, state: r.state, err: +err.toFixed(2), ms: r.ms, prof: r.prof, pts: r.points, inl: r.inliers, ref: r.refined, edges: r.edges, kf: r.keyframes, src: r.source, covered: gt[t].covered, env: r.dbgEnv });
+    rows.push({ t, state: r.state, err: +err.toFixed(2), ms: r.ms, prof: r.prof, pts: r.points, inl: r.inliers, ref: r.refined, edges: r.edges, kf: r.keyframes, src: r.source, covered: gt[t].covered, env: r.dbgEnv, sbi: r.sbi, sbiRaw: r.sbiRaw });
   }
   window.result = { det: det.quad, gt0: q0, lock, rows };
 } catch (e) { window.result = { error: String(e && e.message || e) }; }

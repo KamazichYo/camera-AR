@@ -17,7 +17,7 @@ const IDX_SRC = `(() => { const w = document.querySelector('#view'); const v = (
 
 (async () => {
   const { page: p, errors, close, url } = await launch({ port: 8872, camera: true, viewport: { width: 800, height: 600 }, video: path.join(DIR, 'training.y4m') });
-  await p.goto(`${url}/app/index.html`);
+  await p.goto(`${url}/app/index.html?nogl`); // запасной путь (createImageBitmap) — его защиту от медленного устройства и проверяем
   await p.waitForTimeout(1500);
   if (!(await p.evaluate(() => document.body.classList.contains('running')))) await p.click('#btn-start');
   await p.waitForFunction(() => document.querySelector('#video').videoWidth > 0, null, { timeout: 20000 });

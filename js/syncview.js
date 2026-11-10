@@ -9,9 +9,12 @@
 // соседними обработанными кадрами. Тогда экстраполяции нет, и ошибка — только шум самого трекера.
 // D подстраивается по измеренным задержке и частоте поз и меняется плавно (иначе картинка «плывёт»).
 //
-// Кадры снимаются createImageBitmap(video) на каждом видеокадре (requestVideoFrameCallback) и рисуются
-// в canvas; сам <video> продолжает идти (и запись идёт по его треку — запись задержки не имеет).
+// Кадры снимаются на каждом видеокадре (requestVideoFrameCallback) и рисуются в canvas; сам <video> продолжает
+// идти (и запись идёт по его треку — запись задержки не имеет). Основной путь — WebGL (glframes.js): кадр синхронно
+// загружается в текстуру, и из неё же берётся уменьшенный кадр для трекера, поэтому поза и картинка относятся к
+// одному кадру по построению. Запасной путь (нет WebGL или самопроверка не прошла) — createImageBitmap и 2D-canvas.
 import { applyQuad } from './geometry.js';
+import { GlFrames, checkAgainst2d } from './glframes.js';
 
 const MAX_RING = 24;      // кадров в буфере (≈ 0,8 с)
 const MAX_POSES = 40;
@@ -19,13 +22,21 @@ const MAX_EXTRAP = 70;    // мс: дальше последней позы эк
 const EXTRAP_GAIN = 0.7;  // и не на всю скорость: рывок камеры обычно сменяется торможением, полная скорость «выстреливает»
 const WIDTHS = [1280, 960, 720, 540]; // ширина кадра показа; на слабом телефоне идём вниз по лесенке
 const GRAB_SLOW_MS = 22;  // createImageBitmap дольше этого (в среднем) — телефон не успевает: уменьшаем кадр
+const GL_UP_SLOW_MS = 10;   // путь WebGL: загрузка кадра камеры в текстуру дольше этого (в среднем) — тяжело
+const GL_READ_SLOW_MS = 14; // путь WebGL: чтение уменьшенного кадра для трекера дольше этого — тяжело
 const DRAW_SLOW_MS = 9;   // отрисовка кадра в canvas дольше этого — то же
 
 export class SyncView {
-  constructor(video, canvas) {
+  constructor(video, canvas, { gl = true } = {}) {
     this.video = video;
     this.canvas = canvas;
-    this.ctx = canvas.getContext('2d', { alpha: false });
+    this.wantGl = gl;     // пробовать WebGL (false — сразу запасной путь)
+    this.glf = null;      // GlFrames, когда работает путь WebGL
+    this.ctx = null;      // 2D-контекст запасного пути
+    this.showing = false; // идёт показ (трекинг); до него на пути WebGL кадры снимаются только для трекера
+    this.onFrame = null;  // (кадр) => void — сразу после снимка нового кадра (путь WebGL): трекер берёт его в работу
+    this.glChecks = 0;    // сколько раз самопроверка WebGL была неопределённой
+    this.glOk = false;
     this.active = false;
     this.gen = 0;
     this.ring = [];       // { T, bmp }
@@ -56,26 +67,70 @@ export class SyncView {
   }
 
   get supported() {
-    return 'requestVideoFrameCallback' in this.video && typeof createImageBitmap === 'function';
+    return 'requestVideoFrameCallback' in this.video && (this.wantGl || typeof createImageBitmap === 'function');
   }
 
   _setWidth(maxWidth) {
     const vw = this.video.videoWidth, vh = this.video.videoHeight;
     const k = Math.min(1, maxWidth / Math.max(vw, vh)); // ограничиваем длинную сторону
     this.bw = Math.round(vw * k); this.bh = Math.round(vh * k);
-    this.canvas.width = this.bw; this.canvas.height = this.bh;
+    this._dropRing();
+    if (this.glf) this.glf.resize(this.bw, this.bh);
+    else { this.canvas.width = this.bw; this.canvas.height = this.bh; }
     this.shown = null; // canvas очищен — следующий кадр нарисуется заново
   }
+
+  _free(f) { if (f.bmp) f.bmp.close && f.bmp.close(); else if (this.glf) this.glf.release(f.slot); }
+  _dropRing() {
+    if (this.shown && !this.ring.includes(this.shown)) this._free(this.shown);
+    for (const f of this.ring) this._free(f);
+    this.ring = []; this.shown = null;
+  }
+
+  /** Выбор пути: WebGL, если получается; иначе 2D. Вызывается при запуске. */
+  _initBackend() {
+    if (this.glf || this.ctx) return;
+    if (this.wantGl) {
+      try { this.glf = new GlFrames(this.canvas, MAX_RING + 2); return; } catch (e) { console.warn('WebGL-показ недоступен, запасной путь', e); this.glf = null; }
+      // у canvas, с которого уже просили WebGL, 2D-контекст не получить — берём свежий
+      this._freshCanvas();
+    }
+    this.ctx = this.canvas.getContext('2d', { alpha: false });
+  }
+
+  _freshCanvas() {
+    const c = this.canvas.cloneNode(false);
+    this.canvas.replaceWith(c);
+    this.canvas = c;
+  }
+
+  /** WebGL снял не то, что показывает обычное видео (или контекст потерян): переходим на запасной путь. */
+  _glFallback() {
+    console.warn('WebGL-показ не прошёл самопроверку, запасной путь');
+    this._dropRing();
+    try { this.glf.dispose(); } catch { /* контекст мог быть потерян */ }
+    this.glf = null; this.wantGl = false; this.shown = null;
+    this._freshCanvas();
+    this.ctx = this.canvas.getContext('2d', { alpha: false });
+    this.canvas.width = this.bw; this.canvas.height = this.bh;
+  }
+
+  /** Кадры для трекера берутся отсюда (путь WebGL работает). */
+  get feeds() { return this.active && !!this.glf && !this.glf.lost; }
+  latest() { return this.ring.length ? this.ring[this.ring.length - 1] : null; }
+  /** Уменьшенный кадр (RGBA, w×h) из хранимого кадра — для трекера. */
+  readFrame(f, w, h) { return this.glf && f && f.slot !== undefined ? this.glf.read(f.slot, w, h) : null; }
 
   start(maxWidth = WIDTHS[0]) {
     if (!this.supported || this.active) return this.active;
     if (!this.video.videoWidth) return false;
     this.level = Math.max(0, WIDTHS.findIndex((w) => w <= maxWidth));
     this.failed = false; this.fails = 0; this.inflight = 0; this.grabMs = 0; this.drawMs = 0; this.slowChecks = 0;
+    this._initBackend();
     this._setWidth(WIDTHS[this.level]);
     this.active = true;
-    this.ring = []; this.poses = []; this.shown = null; this.nPoses = 0;
-    this.delay = this.target = 90; this.latency = 40; this.period = 40; this.latDev = 10; this.perDev = 10; this.fp = 0; this.latHist = []; this.perHist = []; this.extrap = 0; this.draws = 0;
+    this.showing = false;
+    this._resetTiming();
     const gen = ++this.gen;
     const cb = (now, md) => {
       if (!this.active || gen !== this.gen) return;
@@ -86,11 +141,74 @@ export class SyncView {
     return true;
   }
 
+  _resetTiming() {
+    this.poses = []; this.shown = null; this.nPoses = 0;
+    this.delay = this.target = 90; this.latency = 40; this.period = 40; this.latDev = 10; this.perDev = 10; this.latHist = []; this.perHist = []; this.extrap = 0; this.draws = 0;
+  }
+
+  /** Трекинг начался: с этого момента картинка показывается из хранимых кадров. */
+  show() {
+    if (!this.active) return;
+    this._resetTiming();
+    this.showing = true;
+  }
+
   stop() {
     this.active = false;
+    this.showing = false;
     this.gen++;
-    for (const f of this.ring) f.bmp.close && f.bmp.close();
-    this.ring = []; this.poses = []; this.shown = null;
+    this._dropRing();
+    this.poses = []; this.shown = null;
+  }
+
+  /**
+   * Метки времени кадров камеры дрожат на несколько мс (особенно на телефонах). Выбор кадра «последний, чья метка не позже
+   * момента показа» из-за этого иногда держит кадр 1, а иногда 3 отрисовки подряд — картинка идёт рывками. Поэтому метки
+   * приводятся к ровной сетке (период и фаза оцениваются на лету); если кадры идут нерегулярно — метка остаётся как есть.
+   */
+  _regUpdate(T) {
+    if (!this.fpLast) { this.fpLast = T; return T; }
+    const dt = T - this.fpLast;
+    this.fpLast = T;
+    if (dt < 8 || dt > 90) { this.fp = 0; return T; }          // пауза/смена частоты — оценка заново
+    if (!this.fp) { this.fp = dt; this.ft0 = T; return T; }
+    const n = Math.max(1, Math.round(dt / this.fp));
+    const per = dt / n;
+    if (Math.abs(per - this.fp) < 0.25 * this.fp) this.fp += 0.04 * (per - this.fp);
+    return this._reg(T, true);
+  }
+
+  _reg(T, learn = false) {
+    if (!this.fp) return T;
+    const k = Math.round((T - this.ft0) / this.fp);
+    const g = this.ft0 + k * this.fp, r = T - g;
+    if (Math.abs(r) > 0.3 * this.fp) { if (learn) this.ft0 = T; return T; } // кадр не на сетке — не трогаем
+    if (learn) this.ft0 += 0.08 * r; // фаза плавно следует за камерой
+    return g;
+  }
+
+  /** Путь WebGL: синхронный снимок кадра в текстуру; трекер сразу получает этот же кадр. */
+  _grabGl(T) {
+    const glf = this.glf, ring = this.ring;
+    if (glf.lost) { this._glFallback(); return; }
+    // место для нового кадра: самый старый не показанный уходит
+    while (ring.length >= MAX_RING) { const k = ring[0] === this.shown ? 1 : 0; this._free(ring[k]); ring.splice(k, 1); }
+    const t0 = performance.now();
+    let slot = -1;
+    try { slot = glf.capture(this.video); } catch (e) { slot = -1; }
+    if (slot < 0) { if (++this.fails >= 6) this._glFallback(); return; }
+    this.fails = 0;
+    // самопроверка на первых кадрах: то ли сняли, что показывает обычное видео
+    if (!this.glOk) {
+      let ok = null;
+      try { ok = checkAgainst2d(glf, slot, this.video); } catch (e) { ok = false; }
+      if (ok === false) { this._glFallback(); return; }
+      if (ok === true || ++this.glChecks >= 20) this.glOk = true;
+    }
+    const f = { T, slot };
+    ring.push(f);
+    if (this.onFrame) { try { this.onFrame(f); } catch (e) { console.warn(e); } }
+    this.grabMs += 0.1 * ((performance.now() - t0) - this.grabMs); // снимок + уменьшенный кадр для трекера
   }
 
   /**
@@ -120,6 +238,8 @@ export class SyncView {
   }
 
   async _grab(T) {
+    if (this.glf) return this._grabGl(T);
+    if (!this.showing) return; // запасной путь снимает кадры только для показа
     // не копим очередь снимков: на слабом телефоне она растёт быстрее, чем разбирается
     if (this.inflight >= 5) return;
     this.inflight++;
@@ -184,12 +304,19 @@ export class SyncView {
    * на самой нижней ступени и всё ещё тяжело — сообщаем приложению (failed), оно вернётся к обычному видео.
    */
   _governor() {
-    if (this.grabMs > GRAB_SLOW_MS || this.drawMs > DRAW_SLOW_MS) this.slowChecks++; else this.slowChecks = Math.max(0, this.slowChecks - 1);
+    const slow = this.glf ? (this.glf.upMs > GL_UP_SLOW_MS || this.glf.readMs > GL_READ_SLOW_MS) : this.grabMs > GRAB_SLOW_MS;
+    if (slow || this.drawMs > DRAW_SLOW_MS) this.slowChecks++; else this.slowChecks = Math.max(0, this.slowChecks - 1);
     if (this.slowChecks < 45) return;
     this.slowChecks = 0;
     if (this.level < WIDTHS.length - 1) {
       this.level++;
       this.grabMs = this.drawMs = 0;
+      if (this.glf) this.glf.upMs = this.glf.readMs = 0;
+      this._setWidth(WIDTHS[this.level]);
+    } else if (this.glf && typeof createImageBitmap === 'function') {
+      // WebGL на этом устройстве медленный (чтение из видеопамяти) — пробуем запасной путь, прежде чем сдаться
+      this.level = 0; this.grabMs = this.drawMs = 0;
+      this._glFallback();
       this._setWidth(WIDTHS[this.level]);
     } else this.failed = true;
   }
@@ -261,13 +388,15 @@ export class SyncView {
     if (!f) f = this.ring[0];
     if (f !== this.shown) {
       const d0 = performance.now();
-      this.ctx.drawImage(f.bmp, 0, 0, this.bw, this.bh);
+      const old = this.shown;
+      if (this.glf) this.glf.draw(f.slot); else this.ctx.drawImage(f.bmp, 0, 0, this.bw, this.bh);
       this.drawMs += 0.1 * ((performance.now() - d0) - this.drawMs);
       this.shown = f;
+      if (old && !this.ring.includes(old)) this._free(old); // прежний показанный кадр уже вытеснен из буфера
       this._governor();
     }
     // кадры старше показанного больше не нужны
-    while (this.ring.length > 2 && this.ring[0].T < f.T - 100) { const o = this.ring.shift(); if (o !== this.shown) o.bmp.close && o.bmp.close(); }
+    while (this.ring.length > 2 && this.ring[0].T < f.T - 100) { const o = this.ring.shift(); if (o !== this.shown) this._free(o); }
     return f.T;
   }
 }

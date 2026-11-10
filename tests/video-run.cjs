@@ -32,6 +32,7 @@ async function runVideo({ taps, step = 1, n = 161, port = 8830, dir, full = fals
   if (process.env.SLOW) q.set('slow', process.env.SLOW);
   if (anchors) q.set('anchors', JSON.stringify(anchors));
   if (process.env.DBG) q.set('dbg', '1');
+  if (process.env.CFG) q.set('cfg', process.env.CFG);
   await page.goto(`${url}/t/video-harness.html?${q}`);
   await page.waitForFunction(() => window.result, null, { timeout: 600000 });
   const r = await page.evaluate(() => window.result);
