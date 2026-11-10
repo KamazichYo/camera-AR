@@ -1,10 +1,10 @@
 // Service worker: офлайн-режим. Оболочка приложения — «сеть, затем кэш»,
 // OpenCV.js с CDN — «кэш, затем сеть» (файл большой и версия зафиксирована).
-const VERSION = 'artcam-v9';
+const VERSION = 'artcam-v10';
 const SHELL = [
   './', 'index.html', 'css/style.css', 'manifest.webmanifest',
   'js/app.js', 'js/geometry.js', 'js/stage.js', 'js/camera.js', 'js/recorder.js',
-  'js/reference.js', 'js/tracker.js', 'js/tracker.worker.js', 'js/syncview.js', 'js/storage.js',
+  'js/reference.js', 'js/tracker.js', 'js/tracker.worker.js', 'js/syncview.js', 'js/glframes.js', 'js/storage.js',
   'icons/icon.svg', 'icons/icon-180.png', 'icons/icon-192.png', 'icons/icon-512.png',
 ];
 
