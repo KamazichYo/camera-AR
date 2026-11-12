@@ -9,6 +9,7 @@ import { Recorder, findOrphans, removeRecordingFile, stamp } from './recorder.js
 import { Reference } from './reference.js';
 import { ArTracker } from './tracker.js';
 import { SyncView } from './syncview.js';
+import { Orient } from './orient.js';
 import { idbGet, idbSet, idbDel, loadSettings, saveSettings } from './storage.js';
 
 const $ = (s) => document.querySelector(s);
@@ -19,7 +20,7 @@ const DEFAULTS = {
   mode: 'color', lineColor: '#ff2d55', grid: false, gridN: 6,
   resolution: '1080', deviceId: null, facing: 'environment', fit: 'contain',
   mic: false, bitrate: 6_000_000,
-  showCanvasFrame: true, surroundings: false, smoothing: 0.5,
+  showCanvasFrame: true, surroundings: false, smoothing: 0.5, arOrient: 'auto',
   wakeLock: true, stats: false, syncView: true,
   quadN: null,
 };
@@ -33,13 +34,26 @@ const persist = () => saveSettings(S);
 
 // ---------- объекты ----------
 const video = $('#video');
-const stage = new Stage($('#stage'), $('#world'), video);
+// ориентация, закреплённая на время AR: сцена, показ и трекер работают с кадрами в ней (см. orient.js)
+const orient = new Orient(video);
+if (new URLSearchParams(location.search).has('uiangle')) orient.forceUi = +new URLSearchParams(location.search).get('uiangle') || 0; // тесты
+const stage = new Stage($('#stage'), $('#world'), orient.view);
+stage.toUi = (x, y) => (orient.ui ? orient.toUi(x, y) : null);
 const camera = new Camera(video);
 const recorder = new Recorder();
 const ref = new Reference();
 const tracker = new ArTracker(video);
+tracker.orient = orient;
 // ?nogl — не использовать WebGL для показа и захвата кадров (запасной путь, для диагностики)
-const sync = new SyncView(video, $('#view'), { gl: !new URLSearchParams(location.search).has('nogl') });
+const sync = new SyncView(video, $('#view'), { gl: !new URLSearchParams(location.search).has('nogl'), orient });
+orient.onChange = (rotChanged, ok) => {
+  if (!ok) { // поток после поворота другой формы (камера перешла на другое разрешение) — кадры не свести, AR заново
+    arStop(true);
+    toast('Камера сменила формат кадра — включите AR заново');
+    return;
+  }
+  stage.layout();
+};
 tracker.source = sync;                  // на пути WebGL трекер берёт кадры из общего буфера показа
 sync.onFrame = () => tracker.kick();
 $('#world').appendChild(ref.canvas);
@@ -239,6 +253,8 @@ async function arBegin() {
     ar.corners = []; ar.pendingTap = null;
     $('#toast').classList.remove('show'); // «Загружаю AR-модуль…» больше не нужна
     ar.mode = 'select';
+    orient.lock(S.arOrient); // с этого момента ориентация кадра и интерфейса не меняется, как ни крути телефон
+    stage.layout();
     updateArUi();
     // общий буфер кадров (WebGL) включается уже на выборе углов: трекер с самого начала видит те же кадры, что пойдут на экран
     if (S.syncView) sync.start();
@@ -379,6 +395,8 @@ function arStop(silent = false) {
   if (ar.mode === 'tracking' && displayQuad) overlayQuad = displayQuad.map((p) => [...p]);
   tracker.stop();
   sync.stop();
+  orient.unlock();
+  stage.layout();
   document.body.classList.remove('synced');
   ar.mode = 'off';
   ar.refCanvas = null; ar.refOverlay = null; ar.corners = []; ar.pendingTap = null; lostWarned = false; noCornerHinted = false;
@@ -461,8 +479,11 @@ function updateArUi() {
 
 // ---------- кадр отрисовки ----------
 let lastCss = '', lastSvg = '';
+let thumbTick = 0;
 function frame(t) {
   requestAnimationFrame(frame);
+  // миниатюра кадра раз в ≈ полсекунды — по ней при повороте телефона проверяется, в какую сторону повернулся поток
+  if (orient.locked && ++thumbTick % 15 === 0) orient.snapThumb();
   if (!video.videoWidth) return;
 
   // Синхронный показ: выбираем кадр с небольшой задержкой и интерполируем позу между соседними обработанными
@@ -597,7 +618,7 @@ function togglePause() {
 }
 
 async function takePhoto() {
-  const blob = await camera.snapshot();
+  const blob = await camera.snapshot('image/jpeg', 0.93, orient.locked ? orient.rot : 0);
   if (!blob) return;
   $('#flash').classList.remove('go'); void $('#flash').offsetWidth; $('#flash').classList.add('go');
   showMedia({ kind: 'photo', blob, name: `art-${stamp()}.jpg` });
@@ -729,6 +750,7 @@ async function updateCameraControls() {
   $('#bitrate').value = String(S.bitrate);
   $('#show-canvas').checked = S.showCanvasFrame;
   $('#surroundings').checked = S.surroundings;
+  $('#ar-orient').value = S.arOrient || 'auto';
   $('#smoothing').value = Math.round(S.smoothing * 100);
   $('#wake').checked = S.wakeLock;
   $('#stats-toggle').checked = S.stats;
@@ -838,6 +860,7 @@ function bind() {
   $('#mic').onchange = (e) => { S.mic = e.target.checked; persist(); };
   $('#bitrate').onchange = (e) => { S.bitrate = +e.target.value; persist(); };
   $('#show-canvas').onchange = (e) => { S.showCanvasFrame = e.target.checked; persist(); };
+  $('#ar-orient').onchange = (e) => { S.arOrient = e.target.value; persist(); if (ar.mode !== 'off') toast('Применится при следующем включении AR'); };
   $('#surroundings').onchange = (e) => {
     S.surroundings = e.target.checked; persist();
     if (ar.mode === 'tracking') toast('Применится при следующем включении AR');
@@ -907,6 +930,8 @@ let lastDims = null;
 function onVideoResize() {
   const d = { w: video.videoWidth, h: video.videoHeight };
   if (!d.w) return;
+  // в AR ориентация закреплена: поворот потока разбирает orient (кадры поворачиваются обратно), здесь ничего не сбрасываем
+  if (orient.locked) { stage.layout(); return; }
   if (lastDims && (lastDims.w !== d.w || lastDims.h !== d.h)) {
     if (ar.mode === 'tracking' || ar.mode === 'select') {
       arStop(true);
@@ -948,6 +973,6 @@ async function init() {
 }
 
 // для отладки и автотестов
-window.artcam = { S, ar, DEBUG, sync, onCornerTap, resetSmoothing, stage, tracker, camera, recorder, ref, get overlayQuad() { return overlayQuad; }, get displayQuad() { return displayQuad; }, arBegin, arStop, loadReference };
+window.artcam = { S, ar, DEBUG, sync, orient, onCornerTap, resetSmoothing, stage, tracker, camera, recorder, ref, get overlayQuad() { return overlayQuad; }, get displayQuad() { return displayQuad; }, arBegin, arStop, loadReference };
 
 init();

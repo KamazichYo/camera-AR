@@ -24,6 +24,8 @@ try {
   let quad0 = null, mode = 'sel';
   if (P.get('dbg')) await call({ type: 'debugPts' });
   if (P.get('cfg')) await call({ type: 'debugCfg', ...JSON.parse(P.get('cfg')) }); // подмена параметров трекера: {cfg:{…}, ecc:{…}}
+  // облегчённый режим включается по времени кадра — зависит от скорости машины; без явной просьбы теста он выключен
+  if (!P.get('slow') && !(P.get('cfg') || '').includes('liteMs')) await call({ type: 'debugCfg', cfg: { liteMs: 1e9 } });
   if (P.get('slow')) await call({ type: 'debugMinMs', ms: +P.get('slow') }); // имитация медленного телефона: каждый кадр не быстрее N мс
   await call({ type: 'selStart' }, await frame(1));
   let ti = 0;
@@ -32,18 +34,18 @@ try {
     const t0 = performance.now();
     let row = { t };
     if (ti < taps.length && taps[ti].f <= t) {
-      const r = await call({ type: 'selTap', point: taps[ti].p, fullFrame: P.get('full') === '1', noAuto: P.get('noauto') === '1' }, f);
+      const r = await call({ type: 'selTap', clock: t * 33.3, point: taps[ti].p, fullFrame: P.get('full') === '1', noAuto: P.get('noauto') === '1' }, f);
       ti++;
       row.tap = { snapped: r.snapped, p: r.p };
-      if (r.type === 'locked') { mode = 'track'; quad0 = r.quad; row.locked = { quad: r.quad, points: r.points, edges: r.edges, weak: r.weak, eccStd: r.eccStd }; }
+      if (r.type === 'locked') { mode = 'track'; quad0 = r.quad; row.locked = { quad: r.quad, points: r.points, edges: r.edges, weak: r.weak, eccStd: r.eccStd, chroma: r.chromaShift, chromaEdges: r.chromaEdges }; }
       else row.pts = r.pts;
     } else if (mode === 'sel') {
-      const r = await call({ type: 'frame' }, f);
+      const r = await call({ type: 'frame', clock: t * 33.3 }, f);
       row.pts = r.pts;
     } else {
       if (mode === 'track') while (anchors.length && anchors[0].f <= t) { const a = anchors.shift(); row.anchor = (await call({ type: 'addAnchor', point: a.p })).n; }
-      const r = await call({ type: 'frame' }, f);
-      row.state = r.state; row.ms = r.ms; row.src = r.source; row.ecc = r.ecc; row.pts = undefined; row.nl = r.points; row.rf = r.refined; row.prof = r.prof; row.edges = r.edges; row.inl = r.inliers; row.rms = r.rms; row.dbg = r.dbgPts; row.env = r.dbgEnv; row.sbi = r.sbi; row.sup = r.dbgSup; row.supN = r.sup; row.sbiRaw = r.sbiRaw; row.anchors = r.anchors;
+      const r = await call({ type: 'frame', clock: t * 33.3 }, f);
+      row.state = r.state; row.ms = r.ms; row.src = r.source; row.ecc = r.ecc; row.pts = undefined; row.nl = r.points; row.rf = r.refined; row.prof = r.prof; row.edges = r.edges; row.inl = r.inliers; row.rms = r.rms; row.dbg = r.dbgPts; row.env = r.dbgEnv; row.sbi = r.sbi; row.sup = r.dbgSup; row.ej = r.dbgEdges; row.lkq = r.dbgLk; row.ep = r.dbgEdgePts; row.supN = r.sup; row.sbiRaw = r.sbiRaw; row.anchors = r.anchors;
       row.quad = r.H && quad0 ? quad0.map((q) => ap(r.H, q)) : null;
     }
     row.dt = Math.round(performance.now() - t0);

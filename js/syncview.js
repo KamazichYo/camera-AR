@@ -15,6 +15,7 @@
 // одному кадру по построению. Запасной путь (нет WebGL или самопроверка не прошла) — createImageBitmap и 2D-canvas.
 import { applyQuad } from './geometry.js';
 import { GlFrames, checkAgainst2d } from './glframes.js';
+import { drawRotated } from './orient.js';
 
 const MAX_RING = 24;      // кадров в буфере (≈ 0,8 с)
 const MAX_POSES = 40;
@@ -27,8 +28,9 @@ const GL_READ_SLOW_MS = 14; // путь WebGL: чтение уменьшенно
 const DRAW_SLOW_MS = 9;   // отрисовка кадра в canvas дольше этого — то же
 
 export class SyncView {
-  constructor(video, canvas, { gl = true } = {}) {
+  constructor(video, canvas, { gl = true, orient = null } = {}) {
     this.video = video;
+    this.orient = orient; // ориентация, закреплённая в AR: кадры снимаются уже повёрнутыми к ней
     this.canvas = canvas;
     this.wantGl = gl;     // пробовать WebGL (false — сразу запасной путь)
     this.glf = null;      // GlFrames, когда работает путь WebGL
@@ -70,8 +72,11 @@ export class SyncView {
     return 'requestVideoFrameCallback' in this.video && (this.wantGl || typeof createImageBitmap === 'function');
   }
 
+  get rot() { return this.orient ? this.orient.rot : 0; }
+
   _setWidth(maxWidth) {
-    const vw = this.video.videoWidth, vh = this.video.videoHeight;
+    const o = this.orient;
+    const vw = o ? o.w : this.video.videoWidth, vh = o ? o.h : this.video.videoHeight;
     const k = Math.min(1, maxWidth / Math.max(vw, vh)); // ограничиваем длинную сторону
     this.bw = Math.round(vw * k); this.bh = Math.round(vh * k);
     this._dropRing();
@@ -119,7 +124,7 @@ export class SyncView {
   get feeds() { return this.active && !!this.glf && !this.glf.lost; }
   latest() { return this.ring.length ? this.ring[this.ring.length - 1] : null; }
   /** Уменьшенный кадр (RGBA, w×h) из хранимого кадра — для трекера. */
-  readFrame(f, w, h) { return this.glf && f && f.slot !== undefined ? this.glf.read(f.slot, w, h) : null; }
+  readFrame(f, w, h, out = null) { return this.glf && f && f.slot !== undefined ? this.glf.read(f.slot, w, h, out) : null; }
 
   start(maxWidth = WIDTHS[0]) {
     if (!this.supported || this.active) return this.active;
@@ -195,13 +200,13 @@ export class SyncView {
     while (ring.length >= MAX_RING) { const k = ring[0] === this.shown ? 1 : 0; this._free(ring[k]); ring.splice(k, 1); }
     const t0 = performance.now();
     let slot = -1;
-    try { slot = glf.capture(this.video); } catch (e) { slot = -1; }
+    try { slot = glf.capture(this.video, this.rot); } catch (e) { slot = -1; }
     if (slot < 0) { if (++this.fails >= 6) this._glFallback(); return; }
     this.fails = 0;
     // самопроверка на первых кадрах: то ли сняли, что показывает обычное видео
     if (!this.glOk) {
       let ok = null;
-      try { ok = checkAgainst2d(glf, slot, this.video); } catch (e) { ok = false; }
+      try { ok = checkAgainst2d(glf, slot, this.video, this.rot); } catch (e) { ok = false; }
       if (ok === false) { this._glFallback(); return; }
       if (ok === true || ++this.glChecks >= 20) this.glOk = true;
     }
@@ -245,10 +250,11 @@ export class SyncView {
     this.inflight++;
     const t0 = performance.now();
     let bmp;
+    const rot = this.rot, odd = rot % 180 !== 0; // снимок — в осях потока; повернём при отрисовке
     try {
       bmp = this.noOpts
         ? await createImageBitmap(this.video)
-        : await createImageBitmap(this.video, { resizeWidth: this.bw, resizeHeight: this.bh, resizeQuality: 'low' });
+        : await createImageBitmap(this.video, { resizeWidth: odd ? this.bh : this.bw, resizeHeight: odd ? this.bw : this.bh, resizeQuality: 'low' });
       this.fails = 0;
     } catch {
       this.inflight--;
@@ -263,7 +269,7 @@ export class SyncView {
     const ring = this.ring;
     let i = ring.length;
     while (i > 0 && ring[i - 1].T > T) i--; // асинхронное завершение может нарушить порядок
-    ring.splice(i, 0, { T, bmp });
+    ring.splice(i, 0, { T, bmp, rot });
     while (ring.length > MAX_RING) { const f = ring.shift(); if (f !== this.shown) f.bmp.close && f.bmp.close(); }
   }
 
@@ -389,7 +395,7 @@ export class SyncView {
     if (f !== this.shown) {
       const d0 = performance.now();
       const old = this.shown;
-      if (this.glf) this.glf.draw(f.slot); else this.ctx.drawImage(f.bmp, 0, 0, this.bw, this.bh);
+      if (this.glf) this.glf.draw(f.slot); else drawRotated(this.ctx, f.bmp, f.bmp.width, f.bmp.height, f.rot || 0, this.bw, this.bh);
       this.drawMs += 0.1 * ((performance.now() - d0) - this.drawMs);
       this.shown = f;
       if (old && !this.ring.includes(old)) this._free(old); // прежний показанный кадр уже вытеснен из буфера
