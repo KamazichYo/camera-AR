@@ -1,4 +1,5 @@
 // Камера: выбор устройства, разрешение, зум, фонарик.
+import { drawRotated } from './orient.js';
 export const RESOLUTIONS = {
   '720': { width: 1280, height: 720 },
   '1080': { width: 1920, height: 1080 },
@@ -71,11 +72,12 @@ export class Camera {
   }
 
   /** Снимок кадра в полном разрешении, без наложения. */
-  async snapshot(type = 'image/jpeg', quality = 0.93) {
+  async snapshot(type = 'image/jpeg', quality = 0.93, rot = 0) {
     const v = this.video;
     const c = document.createElement('canvas');
-    c.width = v.videoWidth; c.height = v.videoHeight;
-    c.getContext('2d').drawImage(v, 0, 0);
+    // rot — поворот к ориентации, закреплённой в AR (снимок выглядит так же, как экран)
+    c.width = rot % 180 ? v.videoHeight : v.videoWidth; c.height = rot % 180 ? v.videoWidth : v.videoHeight;
+    drawRotated(c.getContext('2d'), v, v.videoWidth, v.videoHeight, rot, c.width, c.height);
     return new Promise((r) => c.toBlob(r, type, quality));
   }
 }

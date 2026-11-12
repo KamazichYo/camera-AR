@@ -12,7 +12,8 @@ export class Stage {
   get vh() { return this.video.videoHeight || 720; }
 
   layout() {
-    const r = this.el.getBoundingClientRect();
+    // размеры без учёта CSS-поворота страницы (getBoundingClientRect у повёрнутой страницы даёт переставленные стороны)
+    const r = { width: this.el.clientWidth, height: this.el.clientHeight };
     this.cw = r.width; this.ch = r.height;
     const { vw, vh } = this;
     this.s = this.fit === 'cover' ? Math.max(r.width / vw, r.height / vh) : Math.min(r.width / vw, r.height / vh);
@@ -35,6 +36,8 @@ export class Stage {
   }
 
   eventPoint(e) {
+    // страница может быть повёрнута навстречу повороту экрана (ориентация закреплена в AR): точку переводим в её координаты
+    if (this.toUi) { const p = this.toUi(e.clientX, e.clientY); if (p) return [p[0] - this.el.offsetLeft, p[1] - this.el.offsetTop]; }
     const r = this.el.getBoundingClientRect();
     return [e.clientX - r.left, e.clientY - r.top];
   }

@@ -10,12 +10,20 @@
 // Ориентация: у всех текстур строка 0 — верх кадра (как загружает texImage2D). Промежуточные проходы её сохраняют,
 // поэтому readPixels отдаёт строки сверху вниз; переворот — только при выводе на экран.
 
+// rot — поворот снимаемого кадра по часовой (0–3 четверти): кадр камеры приводится к ориентации, закреплённой в AR
+import { drawRotated } from './orient.js';
+
 const VS = `
 attribute vec2 p;
 uniform float flip;
+uniform float rot;
 varying vec2 uv;
 void main() {
-  uv = vec2(p.x * 0.5 + 0.5, flip > 0.5 ? 0.5 - p.y * 0.5 : p.y * 0.5 + 0.5);
+  vec2 t = vec2(p.x * 0.5 + 0.5, flip > 0.5 ? 0.5 - p.y * 0.5 : p.y * 0.5 + 0.5);
+  if (rot > 0.5 && rot < 1.5) t = vec2(t.y, 1.0 - t.x);
+  else if (rot > 1.5 && rot < 2.5) t = vec2(1.0 - t.x, 1.0 - t.y);
+  else if (rot > 2.5) t = vec2(1.0 - t.y, t.x);
+  uv = t;
   gl_Position = vec4(p, 0.0, 1.0);
 }`;
 const PREC = `
@@ -82,7 +90,7 @@ export class GlFrames {
     gl.bindAttribLocation(p, 0, 'p');
     gl.linkProgram(p);
     if (!gl.getProgramParameter(p, gl.LINK_STATUS)) throw new Error('программа: ' + gl.getProgramInfoLog(p));
-    return { p, flip: gl.getUniformLocation(p, 'flip'), t: gl.getUniformLocation(p, 't'), px: gl.getUniformLocation(p, 'px') };
+    return { p, flip: gl.getUniformLocation(p, 'flip'), rot: gl.getUniformLocation(p, 'rot'), t: gl.getUniformLocation(p, 't'), px: gl.getUniformLocation(p, 'px') };
   }
 
   _texture(w, h) {
@@ -117,7 +125,7 @@ export class GlFrames {
     for (let i = 0; i < this.n; i++) this.ring.push({ ...this._target(bw, bh), free: true });
   }
 
-  _pass(prog, tex, fbo, w, h, flip, px) {
+  _pass(prog, tex, fbo, w, h, flip, px, rot = 0) {
     const gl = this.gl;
     gl.bindFramebuffer(gl.FRAMEBUFFER, fbo);
     gl.viewport(0, 0, w, h);
@@ -126,14 +134,15 @@ export class GlFrames {
     gl.bindTexture(gl.TEXTURE_2D, tex);
     gl.uniform1i(prog.t, 0);
     gl.uniform1f(prog.flip, flip ? 1 : 0);
+    gl.uniform1f(prog.rot, rot);
     if (prog.px && px) gl.uniform2f(prog.px, px[0], px[1]);
     gl.enableVertexAttribArray(0);
     gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 0, 0);
     gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
   }
 
-  /** Снять текущий кадр видео в свободную ячейку. Возвращает номер ячейки или −1 (нет свободных / контекст потерян). */
-  capture(video) {
+  /** Снять текущий кадр видео в свободную ячейку, повернув на rot° по часовой. Возвращает номер ячейки или −1. */
+  capture(video, rot = 0) {
     if (this.lost) return -1;
     const i = this.ring.findIndex((r) => r.free);
     if (i < 0) return -1;
@@ -143,9 +152,10 @@ export class GlFrames {
     gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, video);
     const r = this.ring[i];
     // уменьшение до двух раз билинейная выборка делает чисто; сильнее — с усреднением по площади
-    const ratio = Math.max(video.videoWidth / r.w, video.videoHeight / r.h);
-    if (ratio > 2.05) this._pass(this.box, this.up, r.fbo, r.w, r.h, false, [1 / r.w, 1 / r.h]);
-    else this._pass(this.copy, this.up, r.fbo, r.w, r.h, false);
+    const q = Math.round(rot / 90) & 3, sw = q & 1 ? r.h : r.w, sh = q & 1 ? r.w : r.h; // ячейка в осях источника
+    const ratio = Math.max(video.videoWidth / sw, video.videoHeight / sh);
+    if (ratio > 2.05) this._pass(this.box, this.up, r.fbo, r.w, r.h, false, [1 / sw, 1 / sh], q);
+    else this._pass(this.copy, this.up, r.fbo, r.w, r.h, false, null, q);
     r.free = false;
     this.upMs += 0.1 * (performance.now() - t0 - this.upMs);
     return i;
@@ -159,8 +169,8 @@ export class GlFrames {
     this._pass(this.copy, this.ring[i].tex, null, this.bw, this.bh, true);
   }
 
-  /** Уменьшенная копия кадра из ячейки: RGBA, строки сверху вниз. Новый Uint8Array на каждый вызов (отдаётся воркеру). */
-  read(i, w, h) {
+  /** Уменьшенная копия кадра из ячейки: RGBA, строки сверху вниз. out — готовый буфер нужного размера (или будет новый). */
+  read(i, w, h, out = null) {
     if (this.lost || !this.ring[i]) return null;
     const gl = this.gl;
     if (!this.proc || this.proc.w !== w || this.proc.h !== h) {
@@ -170,7 +180,7 @@ export class GlFrames {
     const t0 = performance.now();
     if (Math.max(this.bw / w, this.bh / h) > 1.5) this._pass(this.box, this.ring[i].tex, this.proc.fbo, w, h, false, [1 / w, 1 / h]);
     else this._pass(this.copy, this.ring[i].tex, this.proc.fbo, w, h, false);
-    const out = new Uint8Array(w * h * 4);
+    if (!out || out.length !== w * h * 4) out = new Uint8Array(w * h * 4);
     gl.readPixels(0, 0, w, h, gl.RGBA, gl.UNSIGNED_BYTE, out);
     if (w > 32) this.readMs += 0.1 * (performance.now() - t0 - this.readMs);
     return out;
@@ -188,14 +198,14 @@ export class GlFrames {
  * Самопроверка: совпадает ли кадр, снятый через WebGL, с тем, что рисует обычный drawImage(video) (ориентация, не чёрный
  * ли он). true — совпадает, false — нет, null — по этому кадру не понять (однотонная картинка).
  */
-export function checkAgainst2d(frames, slot, video) {
+export function checkAgainst2d(frames, slot, video, rot = 0) {
   const N = 16;
   const g = frames.read(slot, N, N);
   if (!g) return false;
   const c = document.createElement('canvas');
   c.width = N; c.height = N;
   const ctx = c.getContext('2d', { willReadFrequently: true });
-  ctx.drawImage(video, 0, 0, N, N);
+  drawRotated(ctx, video, video.videoWidth, video.videoHeight, rot, N, N);
   const d = ctx.getImageData(0, 0, N, N).data;
   const lum = (a, k) => 0.299 * a[k] + 0.587 * a[k + 1] + 0.114 * a[k + 2];
   let ma = 0, mb = 0;

@@ -47,6 +47,13 @@ select {
 }
 select option { background: var(--panel-solid); }
 
+/* ---------- ориентация закреплена (AR), а экран повернулся: вся страница повёрнута навстречу (см. orient.js) ---------- */
+body.ui-rot { position: fixed; left: 0; top: 0; transform-origin: 0 0; }
+/* безопасные отступы: стороны страницы теперь смотрят на другие края экрана */
+body.ui-rot-90 { --safe-t: env(safe-area-inset-left, 0px); --safe-r: env(safe-area-inset-top, 0px); --safe-b: env(safe-area-inset-right, 0px); --safe-l: env(safe-area-inset-bottom, 0px); }
+body.ui-rot-270 { --safe-t: env(safe-area-inset-right, 0px); --safe-r: env(safe-area-inset-bottom, 0px); --safe-b: env(safe-area-inset-left, 0px); --safe-l: env(safe-area-inset-top, 0px); }
+body.ui-rot-180 { --safe-t: env(safe-area-inset-bottom, 0px); --safe-r: env(safe-area-inset-left, 0px); --safe-b: env(safe-area-inset-top, 0px); --safe-l: env(safe-area-inset-right, 0px); }
+
 /* ---------- сцена ---------- */
 #stage {
   position: fixed; inset: 0; overflow: hidden; touch-action: none;

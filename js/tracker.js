@@ -1,5 +1,6 @@
 // Главный поток AR: захват уменьшенных кадров, общение с воркером, перевод координат.
 import { multiply } from './geometry.js';
+import { drawRotated } from './orient.js';
 
 const CV_URLS = [
   'https://cdn.jsdelivr.net/npm/@techstark/opencv-js@4.10.0-release.1/dist/opencv.js',
@@ -74,6 +75,11 @@ export class ArTracker {
   }
 
   _onMessage(m) {
+    if (m.back) { // буфер кадра вернулся из воркера — в запас (не больше трёх)
+      if (!this._pool) this._pool = [];
+      if (this._pool.length < 3) this._pool.push(m.back);
+      delete m.back;
+    }
     const p = this.pending.get(m.id);
     if (!p) return;
     this.pending.delete(m.id);
@@ -83,7 +89,9 @@ export class ArTracker {
 
   /** Размер кадра анализа и точные коэффициенты «видео → кадр анализа». */
   get proc() {
-    const { videoWidth: vw, videoHeight: vh } = this.video;
+    // размеры кадра в закреплённой ориентации (поворот телефона в AR не меняет координат трекера)
+    const o = this.orient;
+    const vw = o ? o.w : this.video.videoWidth, vh = o ? o.h : this.video.videoHeight;
     const s = Math.min(1, this.procMax / Math.max(vw, vh));
     const w = Math.max(16, Math.round(vw * s)), h = Math.max(16, Math.round(vh * s));
     return { w, h, sx: w / vw, sy: h / vh };
@@ -99,7 +107,10 @@ export class ArTracker {
     if (!src || !src.feeds) return null;
     const { w, h } = this.proc;
     const f = src.latest();
-    const px = f && src.readFrame(f, w, h);
+    // буфер — из запаса (вернувшийся из воркера), если подходит по размеру
+    let buf = null;
+    if (this._pool) { const i = this._pool.findIndex((b) => b.byteLength === w * h * 4); if (i >= 0) buf = new Uint8Array(this._pool.splice(i, 1)[0]); }
+    const px = f && src.readFrame(f, w, h, buf);
     return px ? { msg: { buf: px.buffer, w, h }, transfer: [px.buffer], frame: f } : null;
   }
 
@@ -108,7 +119,8 @@ export class ArTracker {
     if (shared) return shared;
     const v = this.video;
     const { w, h } = this.proc;
-    if (this.useBitmap) {
+    const rot = this.orient ? this.orient.rot : 0;
+    if (this.useBitmap && !rot) {
       try {
         const bmp = await createImageBitmap(v, { resizeWidth: w, resizeHeight: h, resizeQuality: 'low' });
         return { msg: { bmp, w, h }, transfer: [bmp] };
@@ -120,7 +132,7 @@ export class ArTracker {
     if (this.canvas.width !== w || this.canvas.height !== h) {
       this.canvas.width = w; this.canvas.height = h;
     }
-    this.ctx.drawImage(v, 0, 0, w, h);
+    drawRotated(this.ctx, v, v.videoWidth, v.videoHeight, rot, w, h);
     const img = this.ctx.getImageData(0, 0, w, h);
     return { msg: { buf: img.data.buffer, w, h }, transfer: [img.data.buffer] };
   }

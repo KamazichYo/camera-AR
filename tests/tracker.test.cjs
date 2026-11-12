@@ -21,7 +21,7 @@ async function run(scene, port) {
   await page.waitForFunction(() => window.result, null, { timeout: 300000 });
   const r = await page.evaluate(() => window.result);
   await close();
-  console.log(`\nСцена «${scene}»`);
+  console.log(`\nСцена «${scene}»`); if (process.env.DBG) console.log('lock', JSON.stringify(r.lock && r.lock.chromaShift));
   if (r.error) { check(false, 'ошибка: ' + r.error); return; }
   for (const [a, z, name, medTol, maxTol] of SCENES[scene]) {
     const rs = r.rows.filter((x) => x.t >= a && x.t < z);
