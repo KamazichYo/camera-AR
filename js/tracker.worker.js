@@ -75,6 +75,7 @@ const CFG = {
   minInliersLK: 8,
   minInliersORB: 16,
   relocEvery: 20,
+  relocStretch: 3,        // во сколько раз может вырасти интервал проверки дрейфа, пока она подтверждает позу
   relocEnv: 8,            // в режиме окружения абсолютную поверхность проверяем чаще         // кадров между проверками дрейфа (ORB)
   driftFix: 5,            // px — если ORB и трекинг расходятся больше, доверяем ORB
   keyframeEveryMs: 2500,
@@ -1973,7 +1974,7 @@ function track(msg) {
   let reloc = null;
   // Проверка дрейфа по ORB — самая тяжёлая операция кадра (на iPhone — десятки–сотни мс, рывок в показе). Пока проверки
   // раз за разом подтверждают позу, интервал растёт (до 3× обычного); первое же расхождение возвращает его к обычному
-  const relocGap = (st.fullFrame ? CFG.relocEnv : CFG.relocEvery) * Math.min(3, 1 + 0.5 * (st.relocCalm || 0));
+  const relocGap = (st.fullFrame ? CFG.relocEnv : CFG.relocEvery) * Math.min(st.fullFrame ? 1 : CFG.relocStretch, 1 + 0.5 * (st.relocCalm || 0)); // (в режиме окружения — как раньше: лист могут сдвинуть)
   if (wasLost || st.frame - st.lastReloc >= relocGap) {
     st.lastReloc = st.frame;
     reloc = relocalize(gray, wasLost ? null : pred);
